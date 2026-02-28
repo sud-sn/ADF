@@ -1,0 +1,112 @@
+# ==============================================================================
+# ADF-to-PySpark Local Converter
+# requirements.txt — Production Dependencies
+# ==============================================================================
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# Ollama (separate install — not a pip package):
+#   macOS/Linux : curl -fsSL https://ollama.ai/install.sh | sh
+#   Windows     : https://ollama.ai/download
+#   Then pull a model: ollama pull codellama
+#
+# PySpark (only needed to RUN the generated scripts, not to generate them):
+#   pip install pyspark>=3.5.0
+#   OR use Databricks / AWS EMR / Azure Synapse directly.
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# [1] CORE RUNTIME
+# ------------------------------------------------------------------------------
+
+# Strict JSON schema validation — backbone of adf_parser.py
+pydantic>=2.5.0,<3.0.0
+
+# Streamlit — UI framework
+# Pinned to minor to avoid breaking API changes mid-project
+streamlit>=1.32.0,<2.0.0
+
+# Ollama Python client — local LLM inference bridge
+# https://github.com/ollama/ollama-python
+ollama>=0.2.0,<1.0.0
+
+
+# ------------------------------------------------------------------------------
+# [2] STREAMLIT ECOSYSTEM
+# ------------------------------------------------------------------------------
+
+# Syntax-highlighted code rendering (used by st.code internally)
+# Pin explicitly to avoid surprise upgrades breaking Streamlit internals
+pygments>=2.17.0,<3.0.0
+
+# Streamlit extras: st.code_editor, st_copy_to_clipboard, etc.
+# Uncomment when you want richer editor components in the UI
+# streamlit-extras>=0.4.0
+
+# Streamlit component for live DAG visualisation (optional, for future use)
+# streamlit-agraph>=0.0.45
+
+
+# ------------------------------------------------------------------------------
+# [3] ASYNC & CONCURRENCY
+# ------------------------------------------------------------------------------
+
+# Async HTTP for Ollama streaming — already a transitive dep of ollama,
+# pinned here so we have an explicit constraint
+httpx>=0.27.0,<1.0.0
+
+# Async utilities
+anyio>=4.3.0,<5.0.0
+
+
+# ------------------------------------------------------------------------------
+# [4] DATA & TYPE UTILITIES
+# ------------------------------------------------------------------------------
+
+# Typing backport: Self, TypeAlias, etc. — needed for Python 3.10 compat
+typing-extensions>=4.9.0
+
+# JSON schema generation / validation (used by Pydantic v2 internally)
+# but also useful when exporting parsed pipeline schemas
+jsonschema>=4.21.0,<5.0.0
+
+# Rich text terminal output — used in CLI mode / pytest output
+rich>=13.7.0,<14.0.0
+
+
+# ------------------------------------------------------------------------------
+# [5] PYSPARK (OPTIONAL — for running generated scripts locally)
+# ------------------------------------------------------------------------------
+
+# Uncomment to run generated PySpark scripts in a local Spark session.
+# Not required just to generate the code.
+#
+# pyspark>=3.5.0,<4.0.0
+# delta-spark>=3.1.0         # if your ADF pipelines target Delta Lake
+
+
+# ------------------------------------------------------------------------------
+# [6] DEVELOPMENT & TESTING
+# ------------------------------------------------------------------------------
+
+# Test runner
+pytest>=8.1.0
+pytest-asyncio>=0.23.0         # async test support for ollama_agent tests
+pytest-cov>=5.0.0              # coverage reports
+pytest-mock>=3.14.0            # mock fixtures
+
+# Code quality
+black>=24.4.0                  # opinionated formatter (matches CI)
+ruff>=0.4.0                    # fast linter (replaces flake8 + isort + pyupgrade)
+mypy>=1.9.0                    # static type checking
+
+# Pydantic mypy plugin — enables strict type checking on Pydantic models
+# Requires mypy config in pyproject.toml:
+#   [tool.mypy]
+#   plugins = ["pydantic.mypy"]
+pydantic[mypy]>=2.5.0,<3.0.0
+
+# Pre-commit hooks (optional — run: pre-commit install)
+# pre-commit>=3.7.0
