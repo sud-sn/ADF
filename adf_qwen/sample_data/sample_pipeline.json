@@ -1,0 +1,233 @@
+{
+  "name": "pl_customer_etl_daily",
+  "type": "Microsoft.DataFactory/factories/pipelines",
+  "properties": {
+    "description": "Daily ETL pipeline: ingests customer delta from Azure SQL, transforms, and sinks to ADLS Gen2 Parquet.",
+    "parameters": {
+      "env": {
+        "type": "String",
+        "defaultValue": "prod"
+      },
+      "watermark_date": {
+        "type": "String",
+        "defaultValue": "2024-01-01"
+      },
+      "max_rows": {
+        "type": "Int",
+        "defaultValue": 100000
+      }
+    },
+    "variables": {
+      "row_count": {
+        "type": "String",
+        "defaultValue": "0"
+      },
+      "pipeline_run_id": {
+        "type": "String",
+        "defaultValue": ""
+      }
+    },
+    "activities": [
+      {
+        "name": "LookupWatermark",
+        "type": "Lookup",
+        "dependsOn": [],
+        "userProperties": [],
+        "typeProperties": {
+          "source": {
+            "type": "AzureSqlSource",
+            "query": "SELECT MAX(updated_at) AS last_watermark FROM dbo.watermark_table WHERE pipeline_name = 'pl_customer_etl_daily'"
+          },
+          "dataset": {
+            "referenceName": "ds_azure_sql_watermark",
+            "type": "DatasetReference"
+          },
+          "firstRowOnly": true
+        }
+      },
+      {
+        "name": "SetRunId",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "LookupWatermark",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "pipeline_run_id",
+          "value": "@pipeline().RunId"
+        }
+      },
+      {
+        "name": "CheckEnvironment",
+        "type": "IfCondition",
+        "dependsOn": [
+          {
+            "activity": "SetRunId",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "typeProperties": {
+          "expression": {
+            "value": "@equals(pipeline().parameters.env, 'prod')",
+            "type": "Expression"
+          },
+          "ifTrueActivities": [
+            {
+              "name": "CopyCustomersProd",
+              "type": "Copy",
+              "dependsOn": [],
+              "inputs": [
+                {
+                  "referenceName": "ds_sql_customers_prod",
+                  "type": "DatasetReference"
+                }
+              ],
+              "outputs": [
+                {
+                  "referenceName": "ds_adls_customers_parquet",
+                  "type": "DatasetReference"
+                }
+              ],
+              "typeProperties": {
+                "source": {
+                  "type": "AzureSqlSource",
+                  "query": "@concat('SELECT * FROM dbo.customers WHERE updated_at > ''', activity('LookupWatermark').output.firstRow.last_watermark, '''')"
+                },
+                "sink": {
+                  "type": "ParquetSink",
+                  "writeBehavior": "overwrite",
+                  "storeSettings": {
+                    "type": "AzureBlobFSWriteSettings"
+                  }
+                },
+                "enableStaging": false,
+                "translator": {
+                  "type": "TabularTranslator",
+                  "columnMappings": "customer_id:id,customer_name:name,email_address:email,created_at:created_ts"
+                }
+              }
+            }
+          ],
+          "ifFalseActivities": [
+            {
+              "name": "CopyCustomersDev",
+              "type": "Copy",
+              "dependsOn": [],
+              "inputs": [
+                {
+                  "referenceName": "ds_sql_customers_dev",
+                  "type": "DatasetReference"
+                }
+              ],
+              "outputs": [
+                {
+                  "referenceName": "ds_adls_customers_dev_parquet",
+                  "type": "DatasetReference"
+                }
+              ],
+              "typeProperties": {
+                "source": {
+                  "type": "AzureSqlSource",
+                  "query": "SELECT TOP 1000 * FROM dbo.customers ORDER BY updated_at DESC"
+                },
+                "sink": {
+                  "type": "ParquetSink",
+                  "writeBehavior": "overwrite"
+                },
+                "enableStaging": false
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "IterateCustomerSegments",
+        "type": "ForEach",
+        "dependsOn": [
+          {
+            "activity": "CheckEnvironment",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "typeProperties": {
+          "isSequential": false,
+          "batchCount": 5,
+          "items": {
+            "value": "@array('premium','standard','trial','churned','new')",
+            "type": "Expression"
+          },
+          "activities": [
+            {
+              "name": "CopySegmentData",
+              "type": "Copy",
+              "dependsOn": [],
+              "inputs": [
+                {
+                  "referenceName": "ds_sql_customer_segment",
+                  "type": "DatasetReference",
+                  "parameters": {
+                    "segment": "@item()"
+                  }
+                }
+              ],
+              "outputs": [
+                {
+                  "referenceName": "ds_adls_segment_parquet",
+                  "type": "DatasetReference",
+                  "parameters": {
+                    "segment": "@item()"
+                  }
+                }
+              ],
+              "typeProperties": {
+                "source": {
+                  "type": "AzureSqlSource",
+                  "query": "@concat('SELECT * FROM dbo.customers WHERE segment = ''', item(), ''' AND updated_at > ''', pipeline().parameters.watermark_date, '''')"
+                },
+                "sink": {
+                  "type": "ParquetSink",
+                  "writeBehavior": "overwrite"
+                },
+                "enableStaging": false
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "UpdateWatermark",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "IterateCustomerSegments",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "row_count",
+          "value": "@string(activity('CopyCustomersProd').output.rowsCopied)"
+        }
+      },
+      {
+        "name": "WaitBeforeNotify",
+        "type": "Wait",
+        "dependsOn": [
+          {
+            "activity": "UpdateWatermark",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "typeProperties": {
+          "waitTimeInSeconds": 10
+        }
+      }
+    ],
+    "annotations": [],
+    "folder": {
+      "name": "ETL/Customer"
+    },
+    "concurrency": 1
+  }
+}
