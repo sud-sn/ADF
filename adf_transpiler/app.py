@@ -56,7 +56,7 @@ with st.sidebar:
     st.divider()
 
     st.subheader("🤖 Ollama Settings")
-    _models = ["codellama", "llama3", "llama3:8b", "llama3:70b", "mistral", "deepseek-coder", "deepseek-coder:6.7b"]
+    _models = ["qwen2.5-coder:7b", "codellama", "llama3", "llama3:8b", "llama3:70b", "mistral", "deepseek-coder", "deepseek-coder:6.7b"]
     _idx = _models.index(state.ollama_model) if state.ollama_model in _models else 0
     selected_model = st.selectbox("Model", options=_models, index=_idx, disabled=state.is_busy, help="Must be pulled: `ollama pull <model>`")
     ollama_url_input = st.text_input("Ollama API URL", value=state.ollama_url, disabled=state.is_busy)

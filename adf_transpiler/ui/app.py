@@ -57,7 +57,7 @@ def _init_state() -> None:
         "parsed_pipeline": None,
         "transpiler_result": None,
         "final_code": None,
-        "ollama_model": "codellama",
+        "ollama_model": "qwen2.5-coder:7b",
         "ollama_url": "http://localhost:11434",
         "translation_log": [],
         "phase": "idle",  # idle | parsed | transpiled | translating | done
@@ -80,7 +80,7 @@ with st.sidebar:
     st.subheader("🤖 Ollama Settings")
     st.session_state.ollama_model = st.selectbox(
         "Model",
-        options=["codellama", "llama3", "llama3:8b", "mistral", "deepseek-coder"],
+        options=["qwen2.5-coder:7b", "codellama", "llama3", "llama3:8b", "mistral", "deepseek-coder"],
         index=0,
         help="Must be pulled locally via `ollama pull <model>`",
     )

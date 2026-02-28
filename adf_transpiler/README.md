@@ -61,11 +61,11 @@ adf_transpiler/
 
 ### 1. Prerequisites
 
-| Requirement | Version | Notes |
-|---|---|---|
-| Python | 3.10+ | Required for `match`/`case` and new type hints |
-| Ollama | Latest | [https://ollama.ai/download](https://ollama.ai/download) |
-| `codellama` model | — | `ollama pull codellama` |
+| Requirement              | Version | Notes                                                    |
+| ------------------------ | ------- | -------------------------------------------------------- |
+| Python                   | 3.10+   | Required for `match`/`case` and new type hints           |
+| Ollama                   | Latest  | [https://ollama.ai/download](https://ollama.ai/download) |
+| `qwen2.5-coder:7b` model | —       | `ollama pull qwen2.5-coder:7b`                           |
 
 ### 2. Install Python dependencies
 
@@ -83,8 +83,9 @@ pip install -r requirements.txt
 ollama serve
 
 # Pull the model (first time only)
+ollama pull qwen2.5-coder:7b
+# Or for alternatives:
 ollama pull codellama
-# Or for better results:
 ollama pull llama3
 ```
 
@@ -110,16 +111,16 @@ The browser opens at `http://localhost:8501`.
 
 ## Supported Activity Types
 
-| ADF Type | Transpiler Support | Template Output |
-|---|---|---|
-| `Copy` | ✅ Full | `spark.read.format(...).load()` + `write.save()` |
-| `ForEach` | ✅ Full | Python `for` loop with inner activity stubs |
-| `IfCondition` | ✅ Full | Python `if/else` block |
-| `SetVariable` | ✅ Full | `pipeline_vars["x"] = ...` |
-| `Wait` | ✅ Full | `time.sleep(n)` |
-| `Lookup` | ⚠ Generic | Raw typeProperties preserved |
-| `ExecutePipeline` | ⚠ Generic | Raw typeProperties preserved |
-| All others | ⚠ Generic | Raw typeProperties preserved with TODO |
+| ADF Type          | Transpiler Support | Template Output                                  |
+| ----------------- | ------------------ | ------------------------------------------------ |
+| `Copy`            | ✅ Full            | `spark.read.format(...).load()` + `write.save()` |
+| `ForEach`         | ✅ Full            | Python `for` loop with inner activity stubs      |
+| `IfCondition`     | ✅ Full            | Python `if/else` block                           |
+| `SetVariable`     | ✅ Full            | `pipeline_vars["x"] = ...`                       |
+| `Wait`            | ✅ Full            | `time.sleep(n)`                                  |
+| `Lookup`          | ⚠ Generic          | Raw typeProperties preserved                     |
+| `ExecutePipeline` | ⚠ Generic          | Raw typeProperties preserved                     |
+| All others        | ⚠ Generic          | Raw typeProperties preserved with TODO           |
 
 ---
 
@@ -161,10 +162,10 @@ pytest
 
 ## Configuration
 
-| Setting | Default | Description |
-|---|---|---|
-| Ollama Model | `codellama` | Change in sidebar — must be pulled locally |
-| Ollama URL | `http://localhost:11434` | Change if Ollama runs on a different port/host |
+| Setting      | Default                  | Description                                    |
+| ------------ | ------------------------ | ---------------------------------------------- |
+| Ollama Model | `qwen2.5-coder:7b`       | Change in sidebar — must be pulled locally     |
+| Ollama URL   | `http://localhost:11434` | Change if Ollama runs on a different port/host |
 
 ---
 

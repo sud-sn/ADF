@@ -16,9 +16,9 @@ Ollama is a separate program that runs in the background to serve the AI models 
 1. Download and install **Ollama for Windows** from [ollama.com/download](https://ollama.com/download).
 2. Once installed, open your terminal (Command Prompt or PowerShell) and pull the default model you'd like to use. For example:
    ```bash
-   ollama pull codellama
+   ollama pull qwen2.5-coder:7b
    ```
-   _(This may take a few minutes as `codellama` is a few gigabytes in size)._
+   _(This may take a few minutes as `qwen2.5-coder:7b` is a few gigabytes in size)._
 3. Verify Ollama is running correctly by verifying the daemon is running in your system tray or by executing:
    ```bash
    ollama serve

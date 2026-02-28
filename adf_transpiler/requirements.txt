@@ -9,7 +9,7 @@
 # Ollama (separate install — not a pip package):
 #   macOS/Linux : curl -fsSL https://ollama.ai/install.sh | sh
 #   Windows     : https://ollama.ai/download
-#   Then pull a model: ollama pull codellama
+#   Then pull a model: ollama pull qwen2.5-coder:7b
 #
 # PySpark (only needed to RUN the generated scripts, not to generate them):
 #   pip install pyspark>=3.5.0

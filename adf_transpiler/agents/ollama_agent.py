@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "codellama"
-FALLBACK_MODEL = "llama3"
+DEFAULT_MODEL = "qwen2.5-coder:7b"
+FALLBACK_MODEL = "codellama"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 _SYSTEM_PROMPT = """\
@@ -92,7 +92,7 @@ class OllamaAgent:
     Parameters
     ----------
     model:
-        Ollama model tag to use (e.g. "codellama", "llama3").
+        Ollama model tag to use (e.g. "qwen2.5-coder:7b", "codellama").
     base_url:
         Base URL for the Ollama API server.
     timeout:

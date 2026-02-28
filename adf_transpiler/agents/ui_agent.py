@@ -135,7 +135,7 @@ class WorkflowState:
     final_code: str | None = None
     translation_log: list[TranslationLogEntry] = field(default_factory=list)
     error_message: str | None = None
-    ollama_model: str = "codellama"
+    ollama_model: str = "qwen2.5-coder:7b"
     ollama_url: str = "http://localhost:11434"
     ollama_connected: bool = False
     total_expressions: int = 0
