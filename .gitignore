@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Streamlit
+.streamlit/
+
+# Environment / secrets
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Output files
+output/
+generated/
+*.spark.py
