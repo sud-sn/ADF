@@ -77,15 +77,15 @@ class WorkflowPhase(Enum):
 
 # Allowed forward transitions (phase → set of valid next phases)
 _VALID_TRANSITIONS: dict[WorkflowPhase, set[WorkflowPhase]] = {
-    WorkflowPhase.IDLE:              {WorkflowPhase.PARSING, WorkflowPhase.ERROR},
+    WorkflowPhase.IDLE:              {WorkflowPhase.PARSING, WorkflowPhase.CONNECTING_OLLAMA, WorkflowPhase.ERROR},
     WorkflowPhase.PARSING:           {WorkflowPhase.PARSED, WorkflowPhase.ERROR},
-    WorkflowPhase.PARSED:            {WorkflowPhase.TRANSPILING, WorkflowPhase.PARSING, WorkflowPhase.ERROR},
+    WorkflowPhase.PARSED:            {WorkflowPhase.TRANSPILING, WorkflowPhase.CONNECTING_OLLAMA, WorkflowPhase.PARSING, WorkflowPhase.ERROR},
     WorkflowPhase.TRANSPILING:       {WorkflowPhase.TRANSPILED, WorkflowPhase.ERROR},
-    WorkflowPhase.TRANSPILED:        {WorkflowPhase.CONNECTING_OLLAMA, WorkflowPhase.PARSING, WorkflowPhase.DONE},
-    WorkflowPhase.CONNECTING_OLLAMA: {WorkflowPhase.TRANSLATING, WorkflowPhase.TRANSPILED, WorkflowPhase.ERROR},
+    WorkflowPhase.TRANSPILED:        {WorkflowPhase.CONNECTING_OLLAMA, WorkflowPhase.TRANSLATING, WorkflowPhase.PARSING, WorkflowPhase.IDLE, WorkflowPhase.DONE},
+    WorkflowPhase.CONNECTING_OLLAMA: {WorkflowPhase.TRANSLATING, WorkflowPhase.TRANSPILED, WorkflowPhase.IDLE, WorkflowPhase.PARSED, WorkflowPhase.DONE, WorkflowPhase.ERROR},
     WorkflowPhase.TRANSLATING:       {WorkflowPhase.DONE, WorkflowPhase.ERROR},
-    WorkflowPhase.DONE:              {WorkflowPhase.IDLE, WorkflowPhase.PARSING},
-    WorkflowPhase.ERROR:             {WorkflowPhase.IDLE, WorkflowPhase.PARSING},
+    WorkflowPhase.DONE:              {WorkflowPhase.IDLE, WorkflowPhase.CONNECTING_OLLAMA, WorkflowPhase.PARSING},
+    WorkflowPhase.ERROR:             {WorkflowPhase.IDLE, WorkflowPhase.CONNECTING_OLLAMA, WorkflowPhase.PARSING},
 }
 
 
@@ -557,6 +557,7 @@ class UIAgent:
         -------
         (success, human_readable_message)
         """
+        previous_phase = self._state.phase
         self._transition(WorkflowPhase.CONNECTING_OLLAMA)
         agent = self._build_ollama_agent()
 
@@ -568,12 +569,12 @@ class UIAgent:
 
         self._state.ollama_connected = ok
 
+        # Return to the phase we were in before the connection check
         if ok:
             self._emit(EventKind.INFO, msg)
-            self._transition(WorkflowPhase.TRANSPILED)  # back to ready state
         else:
             self._emit(EventKind.WARNING, msg)
-            self._transition(WorkflowPhase.TRANSPILED)  # allow retry
+        self._transition(previous_phase)
 
         return ok, msg
 
@@ -607,10 +608,18 @@ class UIAgent:
         self._transition(WorkflowPhase.TRANSLATING)
         yield self._make_event(EventKind.PHASE_CHANGED, "Starting Ollama translation.")
 
-        result = self._state.transpiler_result
-        assert result is not None  # guaranteed by can_translate guard above
+        # ---- Determine mode and get current code + requests ----
+        if self._state.mode == "dataflow":
+            df_result = self._state.dataflow_result
+            assert df_result is not None  # guaranteed by can_translate guard above
+            current_code = df_result.pyspark_code
+            requests = self._build_translation_requests()
+        else:
+            result = self._state.transpiler_result
+            assert result is not None  # guaranteed by can_translate guard above
+            current_code = result.full_code
+            requests = self._build_translation_requests(result)
 
-        requests = self._build_translation_requests(result)
         self._state.total_expressions = len(requests)
         self._state.translated_expressions = 0
 
@@ -620,9 +629,15 @@ class UIAgent:
             return
 
         agent = self._build_ollama_agent()
-        current_code = result.full_code
 
-        for i, req in enumerate(requests):
+        # Create a single event loop for the entire translation session.
+        # asyncio.run() destroys the loop after each call, causing
+        # "Event loop is closed" errors on all subsequent expressions.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+          for i, req in enumerate(requests):
             yield self._make_event(
                 EventKind.PROGRESS,
                 f"[{i + 1}/{len(requests)}] Translating expression in "
@@ -633,7 +648,7 @@ class UIAgent:
                 json_path=req.json_path,
             )
 
-            translation, duration_ms = self._translate_with_retry(agent, req)
+            translation, duration_ms = self._translate_with_retry(agent, req, loop)
 
             log_entry = TranslationLogEntry(
                 activity_name=req.activity_name,
@@ -672,7 +687,10 @@ class UIAgent:
                     error=translation.error,
                 )
 
-        self._state.final_code = current_code
+          self._state.final_code = current_code
+        finally:
+          loop.close()
+
         self._transition(WorkflowPhase.DONE)
         yield self._make_event(
             EventKind.PHASE_CHANGED,
@@ -681,6 +699,7 @@ class UIAgent:
             translated=self._state.translated_expressions,
             total=self._state.total_expressions,
         )
+
 
     # ------------------------------------------------------------------
     # Output helpers
@@ -885,9 +904,16 @@ class UIAgent:
         self,
         agent: OllamaAgent,
         request: TranslationRequest,
+        loop: asyncio.AbstractEventLoop | None = None,
     ) -> tuple[TranslationResult, float]:
         """
         Attempt translation with exponential back-off retry.
+
+        Parameters
+        ----------
+        loop:
+            A pre-created event loop to reuse across calls. If None, a new
+            loop is created via asyncio.run() (single-shot usage only).
 
         Returns
         -------
@@ -909,7 +935,10 @@ class UIAgent:
 
             attempts += 1
             try:
-                tr = asyncio.run(agent.translate_expression(request))
+                if loop is not None:
+                    tr = loop.run_until_complete(agent.translate_expression(request))
+                else:
+                    tr = asyncio.run(agent.translate_expression(request))
                 elapsed_ms = (time.monotonic() - t0) * 1000
                 logger.info(
                     "Translation succeeded on attempt %d (%.0fms): %s",

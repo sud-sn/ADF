@@ -232,22 +232,31 @@ COMMON ADF FUNCTIONS:
 
 MAPPING DATA FLOW RULES:
 When translating ADF Mapping Data Flow expressions to PySpark:
-- Data flow parameters          → dataflow_params["<name>"]
-- Derived Column transform      → df.withColumn("<col>", expr("<expression>"))
-- Filter transform              → df.filter("<condition>") or df.where("<condition>")
-- Join transform                → df_left.join(df_right, on="<key>", how="<type>")
-- Aggregate transform           → df.groupBy("<cols>").agg({"<col>": "<func>"})
-- Select / Rename transform     → df.select("<cols>") / df.withColumnRenamed("<old>", "<new>")
-- Sort transform                → df.orderBy("<cols>")
-- Conditional Split             → multiple df.filter() branches
-- Union transform               → df_a.unionByName(df_b)
-- Lookup transform              → df.join(df_lookup, on="<key>", how="left")
-- Exists transform              → df.join(df_check, on="<key>", how="left_semi")
-- Window functions              → Window.partitionBy("<cols>").orderBy("<cols>")
-- Pivot transform               → df.groupBy("<group>").pivot("<pivot_col>").agg(...)
-- Unpivot transform             → stack() expression via selectExpr
+- ALWAYS use pure PySpark DSL functions: col(), when(), lit(), trim(), otherwise()
+- NEVER wrap your output in expr() strings. We want Python object methods, not SQL.
+- Data flow parameters          → lit(str(dataflow_params.get("<name>", "")))
+- iif(cond, a, b)               → when(cond, a).otherwise(b)
+- isNull(c)                     → col(c).isNull()
+- equals(a, b)                  → a == b
+
+EXAMPLES OF CORRECT DSL TRANSLATION:
+ADF: iif(isNull(DIVI) || trim(DIVI) == '', '0', DIVI)
+BAD: expr("iif(col('DIVI').isNull() || trim(col('DIVI')) == '', '0', DIVI)")
+GOOD: when(col("DIVI").isNull() | (trim(col("DIVI")) == ""), lit("0")).otherwise(col("DIVI"))
+
+ADF: iif(equals(DIVI, '0'), 0, iif(equals(DIVI, PFT_CTR_CD), PFT_CTR_DMS_KEY, 777))
+GOOD: when(col("DIVI") == "0", lit(0)).when(col("DIVI") == col("PFT_CTR_CD"), col("PFT_CTR_DMS_KEY")).otherwise(lit(777))
+
+ADF: toString($Azure_Extract_ID)
+GOOD: lit(str(dataflow_params.get("Azure_Extract_ID", "")))
+
+Other transforms:
+- Filter transform              → df.filter(<condition>) or df.where(<condition>)
+- Join transform                → df_left.join(df_right, on=<condition>, how="<type>")
+- Aggregate transform           → df.groupBy(<cols>).agg(<dsl_expressions>)
 - toString(x)                   → col(x).cast("string")
 - toInteger(x)                  → col(x).cast("integer")
+
 - toDecimal(x)                  → col(x).cast("decimal")
 - iif(cond, true_val, false_val) → when(cond, true_val).otherwise(false_val)
 - case(cond1, val1, ..., default) → when(cond1, val1).when(...).otherwise(default)
@@ -645,27 +654,50 @@ def patch_code_with_translations(
     translations: list[TranslationResult],
 ) -> str:
     """
-    Substitute ADF expression placeholders in generated PySpark code with
-    their Qwen-translated Python equivalents.
+    Substitute LLM placeholder markers in generated PySpark code with
+    their Qwen-translated PySpark DSL equivalents.
 
-    Intentionally conservative — leaves the placeholder intact and appends
-    a warning comment if a substitution point cannot be found unambiguously.
+    Looks for lines containing ``__LLM_PENDING__: <json_path>`` and
+    replaces the ``lit(None)`` placeholder with the translated expression.
+
+    Falls back to raw ADF expression substitution for legacy code.
     """
     patched = pyspark_code
     for result in translations:
         if not result.success:
             continue
+
+        json_path = result.request.json_path
+        pyspark_expr = result.pyspark_expression.strip()
+
+        # Strategy 1: Replace the __LLM_PENDING__ marker line
+        marker = f"__LLM_PENDING__: {json_path}"
+        if marker in patched:
+            # Replace lit(None) with the translated expression on the marker line
+            # Pattern: .withColumn("COL", lit(None))  # __LLM_PENDING__: path
+            patched = patched.replace(
+                f"lit(None))  # {marker}",
+                f"{pyspark_expr})",
+            )
+            # Also remove the DFS comment line above it
+            dfs_comment = f"# DFS: {json_path.split('.')[-1]} = {result.request.adf_expression}"
+            patched = patched.replace(dfs_comment + "\n", "")
+            logger.debug("Patched LLM marker '%s' → '%s'", json_path, pyspark_expr[:60])
+            continue
+
+        # Strategy 2: Legacy fallback — find raw ADF text in the code
         original = result.request.adf_expression
         escaped = re.escape(original)
         new_code, n_subs = re.subn(
             rf'["\']?{escaped}["\']?',
-            result.pyspark_expression,
+            pyspark_expr,
             patched,
             count=1,
         )
         if n_subs:
             patched = new_code
-            logger.debug("Patched '%s' → '%s'", original[:60], result.pyspark_expression[:60])
+            logger.debug("Patched '%s' → '%s'", original[:60], pyspark_expr[:60])
         else:
             logger.warning("Could not find substitution point for: %s", original[:60])
     return patched
+

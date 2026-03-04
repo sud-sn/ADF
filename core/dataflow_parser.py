@@ -155,6 +155,7 @@ class DFSSink:
     name: str
     dataset_ref: str = ""
     description: str = ""
+    inputs: list[str] = field(default_factory=list)
     input_columns: list[DFSColumn] = field(default_factory=list)
     column_mappings: list[SinkColumnMapping] = field(default_factory=list)
     keys: list[str] = field(default_factory=list)
@@ -356,13 +357,48 @@ def _extract_inputs(stmt: str, keyword: str) -> list[str]:
 
 
 def _parse_output_columns(body: str) -> list[DFSColumn]:
-    """Parse ``output(col as type, ...)`` blocks."""
-    m = re.search(r"output\s*\((.*?)\)", body, re.DOTALL)
+    """Parse ``output(col as type, ...)`` blocks using depth-aware matching."""
+    # Find the start of output( using regex
+    m = re.search(r"output\s*\(", body)
     if not m:
         return []
+
+    # Depth-aware extraction: find the matching closing paren
+    start = m.end() - 1  # position of opening (
+    depth = 0
+    i = start
+    while i < len(body):
+        if body[i] == "(":
+            depth += 1
+        elif body[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    inner = body[start + 1:i]
+
     cols: list[DFSColumn] = []
-    for line in m.group(1).split(","):
-        line = line.strip()
+    # Split by comma at depth 0 (respecting nested parens in types)
+    buf = ""
+    d = 0
+    for ch in inner:
+        if ch == "(":
+            d += 1
+            buf += ch
+        elif ch == ")":
+            d -= 1
+            buf += ch
+        elif ch == "," and d == 0:
+            line = buf.strip()
+            cm = re.match(r"(\w+)\s+as\s+([\w()., ]+)", line)
+            if cm:
+                cols.append(DFSColumn(name=cm.group(1), data_type=cm.group(2).strip()))
+            buf = ""
+        else:
+            buf += ch
+    # Don't forget the last item
+    if buf.strip():
+        line = buf.strip()
         cm = re.match(r"(\w+)\s+as\s+([\w()., ]+)", line)
         if cm:
             cols.append(DFSColumn(name=cm.group(1), data_type=cm.group(2).strip()))
@@ -607,6 +643,7 @@ def _parse_statement(stmt: str, json_sources: dict, json_sinks: dict,
             name=output_name,
             dataset_ref=json_meta.get("dataset", {}).get("referenceName", ""),
             description=json_meta.get("description", ""),
+            inputs=inputs,
             input_columns=input_columns,
             column_mappings=col_mappings,
             keys=keys,
@@ -801,9 +838,7 @@ def _topological_sort(
     for t in transformations:
         all_names[t.name] = t.inputs
     for s in sinks:
-        # Find the sink's input from the transformation that feeds it
-        # This is tricky — sinks don't always have explicit inputs in the same way
-        all_names[s.name] = []
+        all_names[s.name] = s.inputs
 
     # Figure out sink inputs from transformations: if a transformation feeds a sink,
     # we need to check which transformation writes to the sink

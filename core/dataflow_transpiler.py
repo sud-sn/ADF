@@ -82,21 +82,21 @@ def _translate_simple_expr(expr: str) -> str:
 
     # Simple function mappings (only for non-nested single calls)
     simple_mappings = {
-        r"\btrim\((\w+)\)": r"trim(col(\1))",
-        r"\bisNull\((\w+)\)": r"col(\1).isNull()",
-        r"\bupper\((\w+)\)": r"upper(col(\1))",
-        r"\blower\((\w+)\)": r"lower(col(\1))",
-        r"\blength\((\w+)\)": r"length(col(\1))",
-        r"\babs\((\w+)\)": r"abs(col(\1))",
-        r"\bceil\((\w+)\)": r"ceil(col(\1))",
-        r"\bfloor\((\w+)\)": r"floor(col(\1))",
-        r"\bround\((\w+)\)": r"round(col(\1))",
-        r"\bsqrt\((\w+)\)": r"sqrt(col(\1))",
+        r"\btrim\((\w+)\)": r'trim(col("\1"))',
+        r"\bisNull\((\w+)\)": r'col("\1").isNull()',
+        r"\bupper\((\w+)\)": r'upper(col("\1"))',
+        r"\blower\((\w+)\)": r'lower(col("\1"))',
+        r"\blength\((\w+)\)": r'length(col("\1"))',
+        r"\babs\((\w+)\)": r'abs(col("\1"))',
+        r"\bceil\((\w+)\)": r'ceil(col("\1"))',
+        r"\bfloor\((\w+)\)": r'floor(col("\1"))',
+        r"\bround\((\w+)\)": r'round(col("\1"))',
+        r"\bsqrt\((\w+)\)": r'sqrt(col("\1"))',
         r"\bcurrentDate\(\)": "current_date()",
         r"\bcurrentTimestamp\(\)": "current_timestamp()",
-        r"\byear\((\w+)\)": r"year(col(\1))",
-        r"\bmonth\((\w+)\)": r"month(col(\1))",
-        r"\bdayOfMonth\((\w+)\)": r"dayofmonth(col(\1))",
+        r"\byear\((\w+)\)": r'year(col("\1"))',
+        r"\bmonth\((\w+)\)": r'month(col("\1"))',
+        r"\bdayOfMonth\((\w+)\)": r'dayofmonth(col("\1"))',
     }
     for pattern, replacement in simple_mappings.items():
         result = re.sub(pattern, replacement, result)
@@ -183,7 +183,12 @@ df_{var} = spark.createDataFrame(df_{var}.rdd, schema=_schema_{var})"""
 
 
 def _transpile_derive(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
-    """Generate PySpark withColumn code for derived columns."""
+    """Generate PySpark withColumn code for derived columns.
+
+    Uses pure PySpark DSL (col, when, lit, trim, etc.) — never wraps
+    PySpark functions inside expr() strings because expr() expects
+    raw Spark SQL, not Python DSL code.
+    """
     var = _safe_var(t.name)
     input_var = _safe_var(t.inputs[0]) if t.inputs else "unknown"
     pending: list[tuple[str, str]] = []
@@ -196,16 +201,60 @@ def _transpile_derive(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]
 
     lines.append(f"df_{var} = df_{input_var}")
 
-    for col_name, expr in t.expressions.items():
-        translated = _translate_simple_expr(expr)
-        if _has_complex_expression(expr):
-            pending.append((f"{t.name}.{col_name}", expr))
-            lines.append(f'df_{var} = df_{var}.withColumn("{col_name}", expr("""{translated}"""))  # TODO: verify LLM translation')
+    for col_name, dfs_expr in t.expressions.items():
+        if _has_complex_expression(dfs_expr):
+            # Complex expression → send to LLM for translation
+            pending.append((f"{t.name}.{col_name}", dfs_expr))
+            # Generate a clean placeholder — LLM will replace this
+            lines.append(f'# DFS: {col_name} = {dfs_expr}')
+            lines.append(f'df_{var} = df_{var}.withColumn("{col_name}", lit(None))  # __LLM_PENDING__: {t.name}.{col_name}')
         else:
-            lines.append(f'df_{var} = df_{var}.withColumn("{col_name}", expr("""{translated}"""))')
+            # Simple expression — translate to PySpark DSL directly
+            pyspark_expr = _translate_to_dsl(dfs_expr)
+            lines.append(f'df_{var} = df_{var}.withColumn("{col_name}", {pyspark_expr})')
 
     lines.append("")
     return "\n".join(lines), pending
+
+
+def _translate_to_dsl(dfs_expr: str) -> str:
+    """
+    Translate a simple DFS expression to pure PySpark DSL code.
+
+    Only handles non-nested cases. Complex/nested expressions should
+    be routed to the LLM via _has_complex_expression() check.
+    """
+    expr_str = dfs_expr.strip()
+
+    # $paramName → lit(str(dataflow_params.get("paramName", "")))
+    if re.match(r"^\$(\w+)$", expr_str):
+        param = re.match(r"^\$(\w+)$", expr_str).group(1)
+        return f'lit(str(dataflow_params.get("{param}", "")))'
+
+    # Simple column reference (bare identifier)
+    if re.match(r"^\w+$", expr_str):
+        return f'col("{expr_str}")'
+
+    # String literal
+    if re.match(r"^'.*'$", expr_str):
+        return f"lit({expr_str})"
+
+    # Numeric literal
+    if re.match(r"^-?\d+(\.\d+)?$", expr_str):
+        return f"lit({expr_str})"
+
+    # true() / false()
+    expr_str = re.sub(r"\btrue\(\)", "lit(True)", expr_str)
+    expr_str = re.sub(r"\bfalse\(\)", "lit(False)", expr_str)
+
+    # $paramName in compound expressions
+    expr_str = re.sub(r"\$(\w+)", r'str(dataflow_params.get("\1", ""))', expr_str)
+
+    # Apply simple function translations
+    expr_str = _translate_simple_expr(expr_str)
+
+    return expr_str
+
 
 
 def _transpile_join(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
@@ -276,12 +325,30 @@ def _transpile_aggregate(t: DFSTransformation) -> tuple[str, list[tuple[str, str
 
     agg_exprs: list[str] = []
     for col_name, expr_str in t.expressions.items():
-        translated = _translate_simple_expr(expr_str)
         if _has_complex_expression(expr_str):
             pending.append((f"{t.name}.{col_name}", expr_str))
-        agg_exprs.append(f'    expr("""{translated}""").alias("{col_name}")')
+            agg_exprs.append(f'    # DFS: {col_name} = {expr_str}')
+            agg_exprs.append(f'    lit(None).alias("{col_name}")  # __LLM_PENDING__: {t.name}.{col_name}')
+        else:
+            translated = _translate_to_dsl(expr_str)
+            agg_exprs.append(f'    {translated}.alias("{col_name}")')
 
-    agg_body = ",\n".join(agg_exprs) if agg_exprs else '    lit(1).alias("_placeholder")'
+    # Join the aggregation expressions. If we have multiple lines (from DFS comments), join with newline.
+    if agg_exprs:
+        # Some are comments, some are real code. Let's just join them nicely.
+        # But wait, agg() takes positional arguments, so only the code lines need commas.
+        # It's cleaner to list them and add commas to the non-comment lines.
+        formatted_exprs = []
+        for i, line in enumerate(agg_exprs):
+            if line.strip().startswith("#"):
+                formatted_exprs.append(line)
+            else:
+                # Is it the last code line?
+                is_last = i == len(agg_exprs) - 1 or all(x.strip().startswith("#") for x in agg_exprs[i+1:])
+                formatted_exprs.append(line + ("" if is_last else ","))
+        agg_body = "\n".join(formatted_exprs)
+    else:
+        agg_body = '    lit(1).alias("_placeholder")'
 
     code = f'''\
 # --- Aggregate: {t.name} ---
@@ -535,6 +602,8 @@ df_{var} = df_{input_var}  # TODO: apply rank
 def _transpile_sink(sink: DFSSink) -> tuple[str, list[tuple[str, str]]]:
     """Generate PySpark write code for a DFS sink."""
     var = _safe_var(sink.name)
+    # Use the sink's input stream variable, not its own name
+    input_var = _safe_var(sink.inputs[0]) if sink.inputs else var
     pending: list[tuple[str, str]] = []
 
     # Determine write mode based on alter row policies
@@ -578,7 +647,7 @@ def _transpile_sink(sink: DFSSink) -> tuple[str, list[tuple[str, str]]]:
 #   from delta.tables import DeltaTable
 #   delta_table = DeltaTable.forPath(spark, "<target_path>")
 #   delta_table.alias("target").merge(
-#       df_{var}.alias("source"),
+#       df_{input_var}.alias("source"),
 #       {' AND '.join(f'"target.{k} = source.{k}"' for k in sink.keys)}
 #   ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()"""
 
@@ -588,7 +657,7 @@ def _transpile_sink(sink: DFSSink) -> tuple[str, list[tuple[str, str]]]:
 # Description: {sink.description}
 # Format: {sink.format} | Batch size: {sink.batch_size or "default"}{upsert_comment}{error_lines}
 (
-    df_{var}{select_lines}{partition_line}
+    df_{input_var}{select_lines}{partition_line}
     .write
     .format("{"delta" if sink.upsertable else "parquet"}")  # TODO: adjust format based on dataset '{sink.dataset_ref}'
     .mode("{write_mode}")
@@ -598,6 +667,7 @@ def _transpile_sink(sink: DFSSink) -> tuple[str, list[tuple[str, str]]]:
 logger.info("Sink [{sink.name}] write complete.")
 '''
     return code, pending
+
 
 
 def _transpile_generic_transform(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
