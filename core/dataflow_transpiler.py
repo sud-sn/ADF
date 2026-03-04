@@ -37,8 +37,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _safe_var(name: str) -> str:
-    """Convert a DFS stream name to a valid Python identifier."""
-    return re.sub(r"[^a-zA-Z0-9_]", "_", name).lower()
+    """Convert a DFS stream name to a valid Python identifier.
+
+    Strips whitespace first, replaces non-alnum chars with ``_``,
+    collapses consecutive underscores, and strips leading/trailing ``_``
+    to avoid unreferenceable names like ``df___insertrows``.
+    """
+    cleaned = name.strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", cleaned).lower()
+    cleaned = re.sub(r"_+", "_", cleaned)       # collapse __ → _
+    cleaned = cleaned.strip("_")                  # strip leading/trailing _
+    return cleaned or "unnamed"
 
 
 def _indent(code: str, spaces: int = 4) -> str:
@@ -47,61 +56,324 @@ def _indent(code: str, spaces: int = 4) -> str:
 
 # ---------------------------------------------------------------------------
 # DFS expression → PySpark expression translator (deterministic)
+#
+# Handles ALL single-level DFS function calls deterministically.
+# Only *nested* function calls (function inside another function's args)
+# are sent to the LLM.  Examples:
+#   trim(X)                   → deterministic (single-level)
+#   equals(A, B)              → deterministic (single-level, two-arg)
+#   toString(X)               → deterministic (single-level cast)
+#   addDays(X, 5)             → deterministic (single-level, two-arg)
+#   iif(A == '0', '1', '2')  → deterministic (single-level, no nested funcs)
+#   iif(isNull(X), '0', X)   → LLM (nested: isNull inside iif)
 # ---------------------------------------------------------------------------
 
-_DFS_EXPR_RE = re.compile(
-    r"\b(iif|isNull|trim|equals|toString|toInteger|toDecimal|toFloat|toLong|"
-    r"toShort|toBoolean|toDate|toTimestamp|concat|length|upper|lower|"
-    r"substring|replace|left|right|round|ceil|floor|abs|power|sqrt|"
-    r"currentDate|currentTimestamp|year|month|dayOfMonth|hour|minute|second|"
-    r"addDays|addMonths|daysBetween|monthsBetween|coalesce|negate|"
-    r"like|rlike|in|between|split|regexReplace|regexExtract|"
-    r"md5|sha2|crc32|ascii|encode|decode)\s*\("
+# All known DFS function names (used for detection).
+_DFS_FUNC_NAMES = frozenset({
+    "iif", "isNull", "trim", "equals", "toString", "toInteger", "toDecimal",
+    "toFloat", "toLong", "toShort", "toBoolean", "toDate", "toTimestamp",
+    "concat", "length", "upper", "lower", "substring", "replace", "left",
+    "right", "round", "ceil", "floor", "abs", "power", "sqrt",
+    "currentDate", "currentTimestamp", "year", "month", "dayOfMonth",
+    "hour", "minute", "second", "addDays", "addMonths", "daysBetween",
+    "monthsBetween", "coalesce", "negate", "like", "rlike", "between",
+    "split", "regexReplace", "regexExtract", "md5", "sha2", "crc32",
+    "ascii", "encode", "decode", "byName", "byPosition", "not",
+    "true", "false", "case",
+})
+
+_DFS_FUNC_RE = re.compile(
+    r"\b(" + "|".join(re.escape(f) for f in sorted(_DFS_FUNC_NAMES, key=len, reverse=True)) + r")\s*\("
 )
 
 
+def _find_matching_paren(expr: str, open_pos: int) -> int:
+    """Return index of the closing ')' matching the '(' at *open_pos*, or -1."""
+    depth = 0
+    i = open_pos
+    in_str = False
+    str_ch = ""
+    while i < len(expr):
+        ch = expr[i]
+        if in_str:
+            if ch == str_ch:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            str_ch = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 def _has_complex_expression(expr: str) -> bool:
-    """Return True if the expression contains DFS function calls that need translation."""
-    return bool(_DFS_EXPR_RE.search(expr))
-
-
-def _translate_simple_expr(expr: str) -> str:
     """
-    Attempt deterministic DFS → PySpark expression translation for simple cases.
+    Return True only if expression has *nested* DFS function calls.
 
-    Returns the translated expression, or the original if too complex.
+    Single-level calls like ``trim(X)``, ``equals(A, B)``, ``toString(Y)``
+    return False — the deterministic translator handles those.
+
+    Nested calls like ``iif(isNull(X), ...)`` return True → sent to LLM.
     """
-    result = expr.strip()
+    calls = list(_DFS_FUNC_RE.finditer(expr))
+    if not calls:
+        return False
 
-    # $paramName → dataflow_params["paramName"]
-    result = re.sub(r"\$(\w+)", r'dataflow_params["\1"]', result)
+    for match in calls:
+        # Position of the opening '('
+        paren_start = match.end() - 1
+        paren_end = _find_matching_paren(expr, paren_start)
+        if paren_end == -1:
+            return True  # Unbalanced parens → treat as complex
 
-    # true() / false() → lit(True) / lit(False)
-    result = re.sub(r"\btrue\(\)", "lit(True)", result)
-    result = re.sub(r"\bfalse\(\)", "lit(False)", result)
+        inner = expr[paren_start + 1:paren_end]
+        # If the arguments themselves contain another DFS function call → nested → complex
+        if _DFS_FUNC_RE.search(inner):
+            return True
 
-    # Simple function mappings (only for non-nested single calls)
-    simple_mappings = {
-        r"\btrim\((\w+)\)": r'trim(col("\1"))',
-        r"\bisNull\((\w+)\)": r'col("\1").isNull()',
-        r"\bupper\((\w+)\)": r'upper(col("\1"))',
-        r"\blower\((\w+)\)": r'lower(col("\1"))',
-        r"\blength\((\w+)\)": r'length(col("\1"))',
-        r"\babs\((\w+)\)": r'abs(col("\1"))',
-        r"\bceil\((\w+)\)": r'ceil(col("\1"))',
-        r"\bfloor\((\w+)\)": r'floor(col("\1"))',
-        r"\bround\((\w+)\)": r'round(col("\1"))',
-        r"\bsqrt\((\w+)\)": r'sqrt(col("\1"))',
-        r"\bcurrentDate\(\)": "current_date()",
-        r"\bcurrentTimestamp\(\)": "current_timestamp()",
-        r"\byear\((\w+)\)": r'year(col("\1"))',
-        r"\bmonth\((\w+)\)": r'month(col("\1"))',
-        r"\bdayOfMonth\((\w+)\)": r'dayofmonth(col("\1"))',
-    }
-    for pattern, replacement in simple_mappings.items():
-        result = re.sub(pattern, replacement, result)
+    return False  # Only single-level function calls → deterministic
 
-    return result
+
+# ---------------------------------------------------------------------------
+# Arg splitting / function call extraction
+# ---------------------------------------------------------------------------
+
+
+def _split_args(inner: str) -> list[str]:
+    """Split comma-separated function args, respecting nested parens and quotes."""
+    args: list[str] = []
+    depth = 0
+    buf = ""
+    in_str = False
+    str_ch = ""
+
+    for ch in inner:
+        if in_str:
+            buf += ch
+            if ch == str_ch:
+                in_str = False
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            str_ch = ch
+            buf += ch
+        elif ch == "(":
+            depth += 1
+            buf += ch
+        elif ch == ")":
+            depth -= 1
+            buf += ch
+        elif ch == "," and depth == 0:
+            args.append(buf.strip())
+            buf = ""
+        else:
+            buf += ch
+
+    if buf.strip():
+        args.append(buf.strip())
+    return args
+
+
+def _try_extract_func(expr: str) -> tuple[str, list[str]] | None:
+    """
+    If *expr* is a single function call ``func(arg1, arg2, ...)``,
+    return ``(func_name, [raw_arg_strings])``.  Otherwise return ``None``.
+    """
+    expr = expr.strip()
+    m = re.match(r"^(\w+)\s*\(", expr)
+    if not m:
+        return None
+
+    func_name = m.group(1)
+    paren_start = m.end() - 1
+    paren_end = _find_matching_paren(expr, paren_start)
+    if paren_end == -1:
+        return None
+    # Must consume the entire expression (nothing after the closing paren)
+    if expr[paren_end + 1:].strip():
+        return None
+
+    inner = expr[paren_start + 1:paren_end]
+    if not inner.strip():
+        return func_name, []
+    return func_name, _split_args(inner)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic single-level function → PySpark DSL
+# ---------------------------------------------------------------------------
+
+
+def _translate_func_call(func_name: str, raw_args: list[str]) -> str | None:
+    """
+    Translate a single-level DFS function call to PySpark DSL.
+
+    Each raw arg is translated via ``_translate_to_dsl`` (wraps bare idents
+    in ``col()``, literals in ``lit()``, params in ``dataflow_params[...]``).
+
+    Returns the PySpark DSL string, or ``None`` if not handled.
+    """
+    # Translate each arg to PySpark DSL
+    args = [_translate_to_dsl(a) for a in raw_args]
+    n = len(args)
+
+    # --- Null / Boolean / Comparison ---
+    if func_name == "isNull" and n == 1:
+        return f"{args[0]}.isNull()"
+    if func_name == "equals" and n == 2:
+        return f"({args[0]} == {args[1]})"
+    if func_name == "not" and n == 1:
+        return f"~({args[0]})"
+    if func_name == "negate" and n == 1:
+        return f"-({args[0]})"
+    if func_name == "true" and n == 0:
+        return "lit(True)"
+    if func_name == "false" and n == 0:
+        return "lit(False)"
+    if func_name == "coalesce" and n >= 1:
+        return f"coalesce({', '.join(args)})"
+    if func_name == "between" and n == 3:
+        return f"{args[0]}.between({args[1]}, {args[2]})"
+
+    # --- iif (conditional — only when args are non-nested) ---
+    if func_name == "iif" and n == 3:
+        cond = _translate_join_condition(raw_args[0].strip())
+        true_val = _translate_to_dsl(raw_args[1].strip())
+        false_val = _translate_to_dsl(raw_args[2].strip())
+        return f"when({cond}, {true_val}).otherwise({false_val})"
+
+    # --- String functions ---
+    if func_name == "trim" and n == 1:
+        return f"trim({args[0]})"
+    if func_name == "upper" and n == 1:
+        return f"upper({args[0]})"
+    if func_name == "lower" and n == 1:
+        return f"lower({args[0]})"
+    if func_name == "length" and n == 1:
+        return f"length({args[0]})"
+    if func_name == "concat" and n >= 1:
+        return f"concat({', '.join(args)})"
+    if func_name == "substring" and n >= 2:
+        pos = raw_args[1].strip()
+        ln = raw_args[2].strip() if n >= 3 else "1"
+        return f"substring({args[0]}, {pos}, {ln})"
+    if func_name == "replace" and n == 3:
+        return f"regexp_replace({args[0]}, {args[1]}, {args[2]})"
+    if func_name == "regexReplace" and n == 3:
+        return f"regexp_replace({args[0]}, {args[1]}, {args[2]})"
+    if func_name == "regexExtract" and n >= 2:
+        idx = raw_args[2].strip() if n >= 3 else "0"
+        return f"regexp_extract({args[0]}, {args[1]}, {idx})"
+    if func_name == "left" and n == 2:
+        return f"{args[0]}.substr(1, {raw_args[1].strip()})"
+    if func_name == "right" and n == 2:
+        ln = raw_args[1].strip()
+        return f"{args[0]}.substr(length({args[0]}) - {ln} + 1, {ln})"
+    if func_name == "like" and n == 2:
+        return f"{args[0]}.like({args[1]})"
+    if func_name == "rlike" and n == 2:
+        return f"{args[0]}.rlike({args[1]})"
+    if func_name == "split" and n == 2:
+        return f"pyspark_split({args[0]}, {args[1]})"
+
+    # --- Cast functions (PySpark type objects, never bare strings) ---
+    if func_name == "toString" and n == 1:
+        return f"{args[0]}.cast(StringType())"
+    if func_name == "toInteger" and n == 1:
+        return f"{args[0]}.cast(IntegerType())"
+    if func_name == "toLong" and n == 1:
+        return f"{args[0]}.cast(LongType())"
+    if func_name == "toFloat" and n == 1:
+        return f"{args[0]}.cast(FloatType())"
+    if func_name == "toShort" and n == 1:
+        return f"{args[0]}.cast(ShortType())"
+    if func_name == "toBoolean" and n == 1:
+        return f"{args[0]}.cast(BooleanType())"
+    if func_name == "toDecimal":
+        if n == 1:
+            return f"{args[0]}.cast(DecimalType(18, 2))"
+        if n == 3:
+            p = raw_args[1].strip()
+            s = raw_args[2].strip()
+            return f"{args[0]}.cast(DecimalType({p}, {s}))"
+    if func_name == "toDate":
+        if n == 1:
+            return f"{args[0]}.cast(DateType())"
+        if n == 2:
+            return f"to_date({args[0]}, {args[1]})"
+    if func_name == "toTimestamp":
+        if n == 1:
+            return f"{args[0]}.cast(TimestampType())"
+        if n == 2:
+            return f"to_timestamp({args[0]}, {args[1]})"
+
+    # --- Math functions ---
+    if func_name == "abs" and n == 1:
+        return f"abs({args[0]})"
+    if func_name == "ceil" and n == 1:
+        return f"ceil({args[0]})"
+    if func_name == "floor" and n == 1:
+        return f"floor({args[0]})"
+    if func_name == "round" and n >= 1:
+        if n == 2:
+            return f"round({args[0]}, {raw_args[1].strip()})"
+        return f"round({args[0]})"
+    if func_name == "sqrt" and n == 1:
+        return f"sqrt({args[0]})"
+    if func_name == "power" and n == 2:
+        return f"pow({args[0]}, {args[1]})"
+
+    # --- Date/Time functions ---
+    if func_name == "currentDate" and n == 0:
+        return "current_date()"
+    if func_name == "currentTimestamp" and n == 0:
+        return "current_timestamp()"
+    if func_name == "year" and n == 1:
+        return f"year({args[0]})"
+    if func_name == "month" and n == 1:
+        return f"month({args[0]})"
+    if func_name == "dayOfMonth" and n == 1:
+        return f"dayofmonth({args[0]})"
+    if func_name == "hour" and n == 1:
+        return f"hour({args[0]})"
+    if func_name == "minute" and n == 1:
+        return f"minute({args[0]})"
+    if func_name == "second" and n == 1:
+        return f"second({args[0]})"
+    if func_name == "addDays" and n == 2:
+        return f"date_add({args[0]}, {raw_args[1].strip()})"
+    if func_name == "addMonths" and n == 2:
+        return f"add_months({args[0]}, {raw_args[1].strip()})"
+    if func_name == "daysBetween" and n == 2:
+        return f"datediff({args[1]}, {args[0]})"
+    if func_name == "monthsBetween" and n == 2:
+        return f"months_between({args[1]}, {args[0]})"
+
+    # --- Hash / Encoding ---
+    if func_name == "md5" and n == 1:
+        return f"md5({args[0]})"
+    if func_name == "sha2" and n == 2:
+        return f"sha2({args[0]}, {raw_args[1].strip()})"
+    if func_name == "crc32" and n == 1:
+        return f"crc32({args[0]})"
+
+    # --- Reference helpers ---
+    if func_name == "byName" and n == 1:
+        # byName("col") → col("col")
+        raw = raw_args[0].strip().strip("'\"")
+        return f'col("{raw}")'
+    if func_name == "byPosition" and n == 1:
+        return f"col({raw_args[0].strip()})"
+
+    # Unknown function → not handled deterministically
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +448,6 @@ df_{var} = (
         code += f"""
 
 # Enforce source schema
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DecimalType, TimestampType, LongType, DoubleType, BooleanType
 _schema_{var} = StructType([{schema_lines}])
 df_{var} = spark.createDataFrame(df_{var}.rdd, schema=_schema_{var})"""
 
@@ -241,14 +512,18 @@ def _wrap_identifier(token: str) -> str:
     # String literal
     if re.match(r"^'.*'$", token) or re.match(r'^".*"$', token):
         return f"lit({token})"
-    # Numeric literal
+    # Numeric literal (must check BEFORE bare identifier — digits match \w+)
     if re.match(r"^-?\d+(\.\d+)?$", token):
         return f"lit({token})"
     # Boolean keywords
     if token in ("True", "False", "None"):
         return f"lit({token})"
-    # Bare identifier → col("...")
-    if re.match(r"^\w+$", token):
+    # Stream.Column dotted reference (e.g. ForTrim.CUNO) → col("CUNO")
+    dot_m = re.match(r"^(\w+)\.(\w+)$", token)
+    if dot_m:
+        return f'col("{dot_m.group(2)}")'
+    # Bare identifier (but NOT pure digits)
+    if re.match(r"^\w+$", token) and not re.match(r"^\d+$", token):
         return f'col("{token}")'
     return token
 
@@ -317,13 +592,15 @@ def _translate_math_expr(expr_str: str) -> str:
 
 def _translate_to_dsl(dfs_expr: str) -> str:
     """
-    Translate a simple DFS expression to pure PySpark DSL code.
+    Translate a DFS expression to pure PySpark DSL code.
 
     Handles:
     - Bare identifiers → col("...")
+    - String / numeric / boolean literals → lit(...)
+    - Parameter references ($name) → lit(str(dataflow_params.get(...)))
+    - Single-level DFS function calls → PySpark equivalents
     - Math expressions → col("A") / col("B") * col("C")
     - Boolean operators && / || → & / | with parenthesised clauses
-    - DFS function calls → PySpark equivalents
     """
     expr_str = dfs_expr.strip()
 
@@ -332,27 +609,40 @@ def _translate_to_dsl(dfs_expr: str) -> str:
         param = re.match(r"^\$(\w+)$", expr_str).group(1)
         return f'lit(str(dataflow_params.get("{param}", "")))'
 
-    # Simple column reference (bare identifier)
-    if re.match(r"^\w+$", expr_str):
-        return f'col("{expr_str}")'
-
     # String literal
-    if re.match(r"^'.*'$", expr_str):
+    if re.match(r"^'.*'$", expr_str) or re.match(r'^".*"$', expr_str):
         return f"lit({expr_str})"
 
-    # Numeric literal
+    # Numeric literal (must check BEFORE bare identifier — digits match \w+)
     if re.match(r"^-?\d+(\.\d+)?$", expr_str):
         return f"lit({expr_str})"
 
-    # true() / false()
+    # Stream.Column dotted reference (e.g. ForTrim.CUNO) → col("CUNO")
+    # In ADF DFS, "StreamName.ColumnName" means column from a specific stream.
+    # In PySpark we just reference the column directly.
+    dot_m = re.match(r"^(\w+)\.(\w+)$", expr_str)
+    if dot_m:
+        col_name = dot_m.group(2)
+        return f'col("{col_name}")'
+
+    # Simple column reference (bare identifier — but NOT pure digits)
+    if re.match(r"^\w+$", expr_str) and not re.match(r"^\d+$", expr_str):
+        return f'col("{expr_str}")'
+
+    # Try to translate as a single function call (covers all ~50 DFS functions)
+    func_match = _try_extract_func(expr_str)
+    if func_match:
+        func_name, raw_args = func_match
+        result = _translate_func_call(func_name, raw_args)
+        if result is not None:
+            return result
+
+    # true() / false() in compound expressions
     expr_str = re.sub(r"\btrue\(\)", "lit(True)", expr_str)
     expr_str = re.sub(r"\bfalse\(\)", "lit(False)", expr_str)
 
-    # $paramName in compound expressions
-    expr_str = re.sub(r"\$(\w+)", r'str(dataflow_params.get("\1", ""))', expr_str)
-
-    # Apply simple function translations
-    expr_str = _translate_simple_expr(expr_str)
+    # $paramName in compound expressions → lit(str(dataflow_params.get("paramName", "")))
+    expr_str = re.sub(r"\$(\w+)", r'lit(str(dataflow_params.get("\1", "")))', expr_str)
 
     # Handle math expressions (contains +, -, *, /)
     if re.search(r"[+\-*/]", expr_str) and not expr_str.startswith("col("):
@@ -395,9 +685,10 @@ def _transpile_join(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
 # --- Join: {t.name} ---
 # Type: {t.join_type} | Match: {t.match_type}
 # Condition (DFS): {t.condition}
-# TIP: Consider .cache() or broadcast() on smaller DataFrames for performance.
+# broadcast() wraps the right (smaller/dimension) table to avoid shuffle.
+# Remove broadcast() if the right table is large (>100MB).
 df_{var} = df_{left_var}.join(
-    df_{right_var},
+    broadcast(df_{right_var}),
     on=({condition}),
     how="{spark_join}",
 )
@@ -407,19 +698,23 @@ logger.info("Join [{t.name}] complete. Rows: %d", df_{var}.count())
 
 
 def _transpile_filter(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
-    """Generate PySpark filter code."""
+    """Generate PySpark filter code using pure DSL — never SQL strings."""
     var = _safe_var(t.name)
     input_var = _safe_var(t.inputs[0]) if t.inputs else "unknown"
     pending: list[tuple[str, str]] = []
 
-    condition = _translate_simple_expr(t.condition)
     if _has_complex_expression(t.condition):
+        # Complex → send to LLM; emit a placeholder that is valid PySpark
         pending.append((f"{t.name}.filter_condition", t.condition))
+        condition_code = f"lit(True)  # __LLM_PENDING__: {t.name}.filter_condition"
+    else:
+        # Deterministic translation → pure PySpark DSL expression
+        condition_code = _translate_join_condition(t.condition)
 
     code = f'''\
 # --- Filter: {t.name} ---
-# Condition: {t.condition}
-df_{var} = df_{input_var}.filter({repr(condition)})
+# DFS condition: {t.condition}
+df_{var} = df_{input_var}.filter({condition_code})
 logger.info("Filter [{t.name}] complete. Rows: %d", df_{var}.count())
 '''
     return code, pending
@@ -524,7 +819,7 @@ df_{var} = df_{input_var}  # TODO: specify column selection
 
 
 def _transpile_alter_row(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
-    """Generate PySpark alter row policy code."""
+    """Generate PySpark alter row policy code using pure DSL."""
     var = _safe_var(t.name)
     input_var = _safe_var(t.inputs[0]) if t.inputs else "unknown"
     pending: list[tuple[str, str]] = []
@@ -537,9 +832,11 @@ def _transpile_alter_row(t: DFSTransformation) -> tuple[str, list[tuple[str, str
     }
     policy_action = policy_map.get(t.alter_row_policy, "upsert")
 
-    condition = _translate_simple_expr(t.alter_row_condition)
     if _has_complex_expression(t.alter_row_condition):
         pending.append((f"{t.name}.alter_row_condition", t.alter_row_condition))
+        condition_code = f"lit(True)  # __LLM_PENDING__: {t.name}.alter_row_condition"
+    else:
+        condition_code = _translate_join_condition(t.alter_row_condition)
 
     code = f'''\
 # --- AlterRow: {t.name} ---
@@ -549,7 +846,7 @@ def _transpile_alter_row(t: DFSTransformation) -> tuple[str, list[tuple[str, str
 # The policy is applied at the sink level (upsert/insert/update/delete).
 df_{var} = df_{input_var}  # Rows marked for: {policy_action}
 _alter_row_policy_{_safe_var(t.name)} = "{policy_action}"
-_alter_row_condition_{_safe_var(t.name)} = {repr(condition)}
+_alter_row_condition_{_safe_var(t.name)} = {condition_code}
 '''
     return code, pending
 
@@ -655,6 +952,7 @@ def _transpile_conditional_split(t: DFSTransformation) -> tuple[str, list[tuple[
     """Generate PySpark conditional split (multiple filter branches).
 
     Each output stream from the split becomes its own filtered DataFrame.
+    Uses pure PySpark DSL conditions — never SQL expression strings.
     """
     input_var = _safe_var(t.inputs[0]) if t.inputs else "unknown"
     pending: list[tuple[str, str]] = []
@@ -665,9 +963,10 @@ def _transpile_conditional_split(t: DFSTransformation) -> tuple[str, list[tuple[
         out_var = _safe_var(output_name)
         if _has_complex_expression(cond):
             pending.append((f"{t.name}.{output_name}", cond))
-            translated = _translate_join_condition(cond)
+            translated = f"lit(True)  # __LLM_PENDING__: {t.name}.{output_name}"
         else:
             translated = _translate_join_condition(cond)
+        lines.append(f'# DFS condition: {cond}')
         lines.append(f'df_{out_var} = df_{input_var}.filter({translated})')
         lines.append(f'logger.info("ConditionalSplit [{t.name}] -> {output_name}: %d rows", df_{out_var}.count())')
 
@@ -851,8 +1150,10 @@ def _dfs_to_spark_type(dfs_type: str) -> str:
         return "IntegerType()"
     if t == "long":
         return "LongType()"
-    if t == "double" or t == "float":
+    if t == "double":
         return "DoubleType()"
+    if t == "float":
+        return "FloatType()"
     if t == "boolean":
         return "BooleanType()"
     if t == "timestamp":
@@ -935,8 +1236,22 @@ class DataFlowTranspiler:
         sink_map = {s.name: s for s in parsed.sinks}
         transform_map = {t.name: t for t in parsed.transformations}
 
+        # Collect secondary split output names — these are virtual topo-sort
+        # nodes whose DataFrames are created by the parent split transpiler.
+        split_output_names: set[str] = set()
+        for t in parsed.transformations:
+            if t.transform_type.value == "split" and t.split_conditions:
+                for out_name in t.split_conditions:
+                    if out_name != t.name:
+                        split_output_names.add(out_name)
+
         # ---- Process in topological order ----
         for name in parsed.transformation_order:
+            # Skip virtual split output nodes — their DataFrames are emitted
+            # by the parent conditional split handler.
+            if name in split_output_names:
+                continue
+
             code_parts.append(f"\n# {'=' * 70}")
 
             if name in source_map:
@@ -1001,15 +1316,19 @@ import logging
 import time
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
-    col, lit, expr, when, trim, upper, lower, length, concat,
+    col, lit, when, trim, upper, lower, length, concat,
     current_date, current_timestamp, year, month, dayofmonth,
-    hour, minute, second, round, ceil, floor, abs, sqrt,
-    coalesce, isnull,
+    hour, minute, second, round, ceil, floor, abs, sqrt, pow,
+    coalesce, isnull, date_add, add_months, datediff,
+    months_between, to_date, to_timestamp, substring,
+    regexp_replace, regexp_extract, md5, sha2,
+    split as pyspark_split, monotonically_increasing_id,
+    broadcast,
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, LongType,
-    DoubleType, DecimalType, BooleanType, TimestampType, DateType,
-    ShortType, ByteType, BinaryType,
+    DoubleType, FloatType, DecimalType, BooleanType, TimestampType,
+    DateType, ShortType, ByteType, BinaryType,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")

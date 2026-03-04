@@ -864,6 +864,7 @@ class UIAgent:
         return OllamaAgent(
             model=self._state.ollama_model,
             base_url=self._state.ollama_url,
+            mode=self._state.mode or "pipeline",
         )
 
     def _build_translation_requests(

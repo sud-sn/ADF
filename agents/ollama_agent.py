@@ -186,6 +186,20 @@ OUTPUT RULES — strictly enforced:
 3. Do NOT wrap output in markdown code fences (no ```python or ```).
 4. Do NOT output "Here is the translation" or similar phrases.
 5. Do NOT add import statements — all PySpark imports are already present.
+6. NEVER use expr() or spark.sql() — output pure PySpark DSL only (col, lit, when, etc.).
+7. NEVER use SQL type names as bare strings in .cast() — use PySpark type objects instead.
+   WRONG: col("x").cast("decimal")   RIGHT: col("x").cast(DecimalType(18, 2))
+   WRONG: col("x").cast("integer")   RIGHT: col("x").cast(IntegerType())
+
+AVAILABLE IMPORTS (already present — do NOT re-import):
+- from pyspark.sql.functions import col, lit, when, trim, upper, lower, length, concat,
+    current_date, current_timestamp, year, month, dayofmonth, hour, minute, second,
+    round, ceil, floor, abs, sqrt, pow, coalesce, isnull, date_add, add_months,
+    datediff, months_between, to_date, to_timestamp, substring,
+    regexp_replace, regexp_extract, md5, sha2, split as pyspark_split
+- from pyspark.sql.types import StringType, IntegerType, LongType, DoubleType,
+    FloatType, DecimalType, BooleanType, TimestampType, DateType
+- import uuid, datetime, timedelta
 
 TRANSLATION RULES:
 - Preserve semantics exactly. Never guess — if ambiguous, emit a short inline
@@ -229,6 +243,15 @@ COMMON ADF FUNCTIONS:
 - @intersection(a, b)          → list(set(a) & set(b))
 - @addDays(date, n)            → date + timedelta(days=n)
 - @formatDateTime(dt, fmt)     → dt.strftime(fmt)
+- @currentDate()               → datetime.utcnow().strftime("%Y-%m-%d")
+- @currentTimestamp()           → datetime.utcnow().isoformat()
+
+PATTERN MATCHING (for Data Flow mode):
+- like(x, pattern)             → col("x").like(pattern)
+- rlike(x, pattern)            → col("x").rlike(pattern)
+- regexReplace(x, regex, rep)  → regexp_replace(col("x"), regex, rep)
+- regexExtract(x, regex, idx)  → regexp_extract(col("x"), regex, idx)
+- power(x, n)                  → pow(col("x"), n)
 
 MAPPING DATA FLOW RULES:
 When translating ADF Mapping Data Flow expressions to PySpark:
@@ -254,15 +277,44 @@ Other transforms:
 - Filter transform              → df.filter(<condition>) or df.where(<condition>)
 - Join transform                → df_left.join(df_right, on=<condition>, how="<type>")
 - Aggregate transform           → df.groupBy(<cols>).agg(<dsl_expressions>)
-- toString(x)                   → col(x).cast("string")
-- toInteger(x)                  → col(x).cast("integer")
 
-- toDecimal(x)                  → col(x).cast("decimal")
+CAST TYPE MAPPING (always use type objects, never bare strings):
+- toString(x)                   → col("x").cast(StringType())
+- toInteger(x)                  → col("x").cast(IntegerType())
+- toDecimal(x)                  → col("x").cast(DecimalType(18, 2))
+- toDecimal(x, p, s)            → col("x").cast(DecimalType(p, s))
+- toFloat(x)                    → col("x").cast(FloatType())
+- toLong(x)                     → col("x").cast(LongType())
+- toShort(x)                    → col("x").cast(ShortType())
+- toBoolean(x)                  → col("x").cast(BooleanType())
+- toDate(x, fmt)                → to_date(col("x"), fmt)
+- toTimestamp(x, fmt)            → to_timestamp(col("x"), fmt)
+- negate(x)                     → -col("x")
 - iif(cond, true_val, false_val) → when(cond, true_val).otherwise(false_val)
 - case(cond1, val1, ..., default) → when(cond1, val1).when(...).otherwise(default)
-- isNull(x)                     → col(x).isNull()
+- isNull(x)                     → col("x").isNull()
 - byName("<col>")               → col("<col>")
 - byPosition(n)                 → use column index in select
+
+DATE/TIME FUNCTIONS:
+- minute(x)                     → minute(col("x"))
+- second(x)                     → second(col("x"))
+- hour(x)                       → hour(col("x"))
+- year(x)                       → year(col("x"))
+- month(x)                      → month(col("x"))
+- dayOfMonth(x)                 → dayofmonth(col("x"))
+- addDays(x, n)                 → date_add(col("x"), n)
+- addMonths(x, n)               → add_months(col("x"), n)
+- daysBetween(a, b)             → datediff(col("b"), col("a"))
+- monthsBetween(a, b)           → months_between(col("b"), col("a"))
+
+HASH / ENCODING FUNCTIONS:
+- md5(x)                        → md5(col("x"))
+- sha2(x, bits)                 → sha2(col("x"), bits)
+- crc32(x)                      → crc32(col("x"))
+- ascii(x)                      → ascii(col("x"))
+- encode(x, charset)            → encode(col("x"), charset)
+- decode(x, charset)            → decode(col("x"), charset)
 """
 
 
@@ -280,20 +332,38 @@ OUTPUT RULES — strictly enforced:
 3. Do NOT wrap output in markdown code fences (no ```python or ```).
 4. Do NOT output "Here is the translation" or similar phrases.
 5. Do NOT add import statements — all PySpark imports are already present.
+6. NEVER use expr() or spark.sql() — output pure PySpark DSL only.
+7. NEVER use SQL type names as bare strings in .cast() — use PySpark type objects instead.
+
+AVAILABLE IMPORTS (already present — do NOT re-import):
+- from pyspark.sql.functions import col, lit, when, trim, upper, lower, length, concat,
+    current_date, current_timestamp, year, month, dayofmonth, hour, minute, second,
+    round, ceil, floor, abs, sqrt, pow, coalesce, isnull, date_add, add_months,
+    datediff, months_between, to_date, to_timestamp, substring,
+    regexp_replace, regexp_extract, md5, sha2, split as pyspark_split
+- from pyspark.sql.types import StringType, IntegerType, LongType, DoubleType,
+    FloatType, DecimalType, BooleanType, TimestampType, DateType
 
 DFS EXPRESSION TRANSLATION RULES:
 - iif(cond, true_val, false_val)  → when(cond, true_val).otherwise(false_val)
 - isNull(x)                       → col("x").isNull()
 - trim(x)                         → trim(col("x"))
 - equals(a, b)                    → col("a") == col("b")
-- toString(x)                     → col("x").cast("string")
-- toInteger(x)                    → col("x").cast("integer")
+- negate(x)                       → -col("x")
+
+CAST TYPE MAPPING (always use PySpark type objects, NEVER bare strings):
+- toString(x)                     → col("x").cast(StringType())
+- toInteger(x)                    → col("x").cast(IntegerType())
 - toDecimal(x, p, s)              → col("x").cast(DecimalType(p, s))
-- toFloat(x)                      → col("x").cast("float")
-- toLong(x)                       → col("x").cast("long")
-- toBoolean(x)                    → col("x").cast("boolean")
+- toDecimal(x)                    → col("x").cast(DecimalType(18, 2))
+- toFloat(x)                      → col("x").cast(FloatType())
+- toLong(x)                       → col("x").cast(LongType())
+- toBoolean(x)                    → col("x").cast(BooleanType())
+- toShort(x)                      → col("x").cast(ShortType())
 - toDate(x, fmt)                  → to_date(col("x"), fmt)
 - toTimestamp(x, fmt)              → to_timestamp(col("x"), fmt)
+
+STRING FUNCTIONS:
 - concat(a, b, ...)               → concat(col("a"), col("b"), ...)
 - length(x)                       → length(col("x"))
 - upper(x)                        → upper(col("x"))
@@ -302,32 +372,48 @@ DFS EXPRESSION TRANSLATION RULES:
 - replace(x, old, new)            → regexp_replace(col("x"), old, new)
 - left(x, n)                      → col("x").substr(1, n)
 - right(x, n)                     → col("x").substr(-n, n)
+
+MATH FUNCTIONS:
 - round(x, n)                     → round(col("x"), n)
 - ceil(x)                         → ceil(col("x"))
 - floor(x)                        → floor(col("x"))
 - abs(x)                          → abs(col("x"))
 - sqrt(x)                         → sqrt(col("x"))
 - power(x, n)                     → pow(col("x"), n)
+
+DATE FUNCTIONS:
 - currentDate()                   → current_date()
 - currentTimestamp()               → current_timestamp()
 - year(x)                         → year(col("x"))
 - month(x)                        → month(col("x"))
 - dayOfMonth(x)                   → dayofmonth(col("x"))
 - hour(x)                         → hour(col("x"))
+- minute(x)                       → minute(col("x"))
+- second(x)                       → second(col("x"))
 - addDays(x, n)                   → date_add(col("x"), n)
 - addMonths(x, n)                 → add_months(col("x"), n)
 - daysBetween(a, b)               → datediff(col("b"), col("a"))
 - monthsBetween(a, b)             → months_between(col("b"), col("a"))
+
+OTHER FUNCTIONS:
 - coalesce(a, b, ...)             → coalesce(col("a"), col("b"), ...)
 - like(x, pattern)                → col("x").like(pattern)
 - rlike(x, pattern)               → col("x").rlike(pattern)
 - in(x, [a, b, ...])             → col("x").isin([a, b, ...])
 - between(x, low, high)           → col("x").between(low, high)
-- split(x, delim)                 → split(col("x"), delim)
+- split(x, delim)                 → pyspark_split(col("x"), delim)
 - regexReplace(x, regex, rep)     → regexp_replace(col("x"), regex, rep)
 - regexExtract(x, regex, idx)     → regexp_extract(col("x"), regex, idx)
 - md5(x)                          → md5(col("x"))
 - sha2(x, bits)                   → sha2(col("x"), bits)
+- crc32(x)                        → crc32(col("x"))
+- ascii(x)                        → ascii(col("x"))
+- encode(x, charset)              → encode(col("x"), charset)
+- decode(x, charset)              → decode(col("x"), charset)
+- not(x)                          → ~(x)
+- byName("<col>")                 → col("<col>")
+- byPosition(n)                   → use column index in select
+- case(cond1, val1, ..., default) → when(cond1, val1).when(...).otherwise(default)
 - true()                          → lit(True)
 - false()                         → lit(False)
 - $paramName                      → dataflow_params["paramName"]
@@ -340,6 +426,7 @@ NESTED EXPRESSIONS:
   → when(col("A").isNull() | (trim(col("A")) == lit("")), lit("0")).otherwise(col("A"))
 
 Always use col() for column references and lit() for literal values.
+NEVER use expr() to wrap PySpark DSL code — that produces invalid SQL.
 """
 
 
@@ -392,17 +479,47 @@ _QWEN_ARTEFACT_PATTERNS: list[re.Pattern] = [
     re.compile(r"^Note:.*$", re.MULTILINE | re.IGNORECASE),  # trailing notes
 ]
 
+# SQL-style cast strings → PySpark type objects (safety net for LLM output)
+_SQL_CAST_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'\.cast\(\s*"string"\s*\)'), ".cast(StringType())"),
+    (re.compile(r'\.cast\(\s*"integer"\s*\)'), ".cast(IntegerType())"),
+    (re.compile(r'\.cast\(\s*"int"\s*\)'), ".cast(IntegerType())"),
+    (re.compile(r'\.cast\(\s*"long"\s*\)'), ".cast(LongType())"),
+    (re.compile(r'\.cast\(\s*"double"\s*\)'), ".cast(DoubleType())"),
+    (re.compile(r'\.cast\(\s*"float"\s*\)'), ".cast(FloatType())"),
+    (re.compile(r'\.cast\(\s*"boolean"\s*\)'), ".cast(BooleanType())"),
+    (re.compile(r'\.cast\(\s*"timestamp"\s*\)'), ".cast(TimestampType())"),
+    (re.compile(r'\.cast\(\s*"date"\s*\)'), ".cast(DateType())"),
+    (re.compile(r'\.cast\(\s*"decimal"\s*\)'), ".cast(DecimalType(18, 2))"),
+    (re.compile(r'\.cast\(\s*"short"\s*\)'), ".cast(ShortType())"),
+    (re.compile(r'\.cast\(\s*"byte"\s*\)'), ".cast(ByteType())"),
+    (re.compile(r'\.cast\(\s*"binary"\s*\)'), ".cast(BinaryType())"),
+]
+
+# Pattern to strip expr() wrappers: expr("...") → ...
+_EXPR_WRAPPER_RE = re.compile(r'\bexpr\(\s*(["\'])(.*?)\1\s*\)')
+
 
 def _clean_qwen_output(raw: str) -> str:
     """
     Strip Qwen2.5-Coder-specific artefacts from raw model output.
 
     Applies patterns in order, then strips leading/trailing whitespace.
-    More conservative than a single regex — easier to debug and extend.
+    Also removes expr() wrappers and replaces SQL-style .cast("type")
+    with proper PySpark type objects as a safety net.
     """
     cleaned = raw
     for pattern in _QWEN_ARTEFACT_PATTERNS:
         cleaned = pattern.sub("", cleaned)
+
+    # Strip expr() wrappers: expr("col('x').isNull()") → col('x').isNull()
+    # This is critical because expr() expects SQL syntax, not PySpark DSL
+    cleaned = _EXPR_WRAPPER_RE.sub(r"\2", cleaned)
+
+    # Replace SQL-style cast strings with PySpark type objects
+    for cast_pattern, cast_replacement in _SQL_CAST_REPLACEMENTS:
+        cleaned = cast_pattern.sub(cast_replacement, cleaned)
+
     return cleaned.strip()
 
 
@@ -433,16 +550,19 @@ class OllamaAgent:
         model: str = DEFAULT_MODEL,
         base_url: str = OLLAMA_BASE_URL,
         timeout: int = 180,          # Qwen 7B is slower than CodeLlama
+        mode: str = "pipeline",      # "pipeline" or "dataflow"
     ) -> None:
         self.model = model
         self.base_url = base_url
         self.timeout = timeout
+        self.mode = mode
         self._profile: ModelProfile = get_model_profile(model)
         self._client: "ollama.AsyncClient | None" = None  # type: ignore[name-defined]
         logger.info(
-            "OllamaAgent initialised: model=%s profile=%s",
+            "OllamaAgent initialised: model=%s profile=%s mode=%s",
             model,
             self._profile.description,
+            mode,
         )
 
     # ------------------------------------------------------------------
@@ -531,7 +651,7 @@ class OllamaAgent:
             async for chunk in await client.chat(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": get_system_prompt(self.mode)},
                     {"role": "user",   "content": user_prompt},
                 ],
                 stream=True,

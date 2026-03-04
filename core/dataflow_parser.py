@@ -427,14 +427,67 @@ def _parse_output_columns(body: str) -> list[DFSColumn]:
 def _parse_key_value_options(body: str) -> dict[str, str]:
     """
     Extract key: value pairs from the body, handling quoted string values
-    and boolean/numeric values.
+    that may contain escaped quotes (doubled '' inside '...').
+
+    This is crucial for SQL queries like:
+        sqlQuery: 'select TRIM(BOTH '' '' FROM PFT_CTR_CD) as PFT_CTR_CD...'
+    where the old regex ``'([^']*)'`` would truncate at the first internal quote.
     """
     opts: dict[str, str] = {}
-    # Match patterns like: key: 'value' or key: value or key: true
-    for m in re.finditer(r"(\w+)\s*:\s*(?:'([^']*)'|\"([^\"]*)\"|(\w+))", body):
+    i = 0
+    n = len(body)
+
+    while i < n:
+        # Look for: identifier followed by colon
+        m = re.match(r"(\w+)\s*:\s*", body[i:])
+        if not m:
+            i += 1
+            continue
+
         key = m.group(1)
-        val = m.group(2) or m.group(3) or m.group(4) or ""
-        opts[key] = val
+        i += m.end()
+
+        if i >= n:
+            break
+
+        # Value parsing
+        ch = body[i]
+
+        if ch in ("'", '"'):
+            # Quoted string — read until unescaped closing quote.
+            # Escaped quotes are doubled: '' inside '...' or "" inside "..."
+            quote = ch
+            i += 1  # skip opening quote
+            val_parts: list[str] = []
+            while i < n:
+                if body[i] == quote:
+                    # Check for doubled/escaped quote
+                    if i + 1 < n and body[i + 1] == quote:
+                        val_parts.append(quote)
+                        i += 2  # skip both
+                        continue
+                    else:
+                        i += 1  # skip closing quote
+                        break
+                elif body[i] == "\\" and i + 1 < n and body[i + 1] == quote:
+                    # Backslash-escaped quote: \' or \"
+                    val_parts.append(quote)
+                    i += 2
+                    continue
+                else:
+                    val_parts.append(body[i])
+                    i += 1
+            opts[key] = "".join(val_parts)
+
+        else:
+            # Unquoted value — read word chars
+            vm = re.match(r"(\w+)", body[i:])
+            if vm:
+                opts[key] = vm.group(1)
+                i += vm.end()
+            else:
+                i += 1
+
     return opts
 
 
@@ -883,21 +936,35 @@ def _topological_sort(
     Compute a valid execution order for transformations.
 
     Sources → intermediate transforms → sinks.
+
+    Conditional splits produce multiple output stream names (e.g. out1, out2).
+    All output names are registered as virtual nodes that depend on the split,
+    so any downstream node referencing a secondary output is placed correctly.
     """
     # Build adjacency and in-degree maps
     all_names: dict[str, list[str]] = {}  # name → inputs
 
     for s in sources:
         all_names[s.name] = []
+
+    # Track conditional split secondary outputs → map them to their parent
+    split_alias_to_parent: dict[str, str] = {}  # secondary_output → parent_name
+
     for t in transformations:
         all_names[t.name] = t.inputs
-    for s in sinks:
-        all_names[s.name] = s.inputs
 
-    # Figure out sink inputs from transformations: if a transformation feeds a sink,
-    # we need to check which transformation writes to the sink
-    # In DFS, the sink statement has an input: "input_stream sink(...) ~> sink_name"
-    # We stored that as a transformation's inputs in _extract_inputs
+        # Conditional splits: register ALL output names as virtual nodes
+        if t.transform_type == DFSTransformType.CONDITIONAL_SPLIT and t.split_conditions:
+            for output_name in t.split_conditions:
+                if output_name != t.name:
+                    # Secondary output depends on the split itself
+                    all_names[output_name] = [t.name]
+                    split_alias_to_parent[output_name] = t.name
+
+    for s in sinks:
+        # Resolve sink inputs: if a sink references a split secondary output,
+        # the edge is already registered above
+        all_names[s.name] = s.inputs
 
     in_degree: dict[str, int] = {name: 0 for name in all_names}
     graph: dict[str, list[str]] = {name: [] for name in all_names}
