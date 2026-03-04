@@ -606,11 +606,6 @@ def _transpile_sink(sink: DFSSink) -> tuple[str, list[tuple[str, str]]]:
     input_var = _safe_var(sink.inputs[0]) if sink.inputs else var
     pending: list[tuple[str, str]] = []
 
-    # Determine write mode based on alter row policies
-    write_mode = "overwrite"
-    if sink.upsertable:
-        write_mode = "overwrite"  # PySpark doesn't have native upsert; use merge pattern
-
     # Build column mapping select
     select_lines = ""
     if sink.column_mappings:
@@ -637,25 +632,47 @@ def _transpile_sink(sink: DFSSink) -> tuple[str, list[tuple[str, str]]]:
         if sink.rejected_data_path:
             pending.append((f"{sink.name}.rejected_data_path", sink.rejected_data_path))
 
-    # Build upsert hint
-    upsert_comment = ""
+    # Determine whether to use standard write or delta merge
     if sink.upsertable and sink.keys:
         keys_str = ", ".join(f'"{k}"' for k in sink.keys)
-        upsert_comment = f"""
-# Upsert mode: keys=[{keys_str}]
-# For true upsert, use Delta Lake merge:
-#   from delta.tables import DeltaTable
-#   delta_table = DeltaTable.forPath(spark, "<target_path>")
-#   delta_table.alias("target").merge(
-#       df_{input_var}.alias("source"),
-#       {' AND '.join(f'"target.{k} = source.{k}"' for k in sink.keys)}
-#   ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()"""
+        # Using string interpolation to generate actual code, so use raw strings inside the f-string correctly
+        # The condition will look like: f"target.{k} = source.{k}" and we join them with AND
+        merge_conditions_str = " AND ".join(f"target.{k} = source.{k}" for k in sink.keys)
 
-    code = f'''\
-# --- Sink: {sink.name} ---
-# Dataset: {sink.dataset_ref}
-# Description: {sink.description}
-# Format: {sink.format} | Batch size: {sink.batch_size or "default"}{upsert_comment}{error_lines}
+        write_code = f'''\
+# Upsert mode: keys=[{keys_str}]
+# Using Delta Lake merge for true upsert
+from delta.tables import DeltaTable
+
+# TODO: Configure target path for dataset '{sink.dataset_ref}'
+_target_path_{var} = "<target_path>"
+
+try:
+    delta_table_{var} = DeltaTable.forPath(spark, _target_path_{var})
+    (
+        delta_table_{var}.alias("target").merge(
+            (
+                df_{input_var}{select_lines}{partition_line}
+            ).alias("source"),
+            "{merge_conditions_str}"
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+except Exception as e:
+    logger.warning("Delta table merge failed (table might not exist yet). Falling back to overwrite. Error: %s", e)
+    (
+        df_{input_var}{select_lines}{partition_line}
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .save(_target_path_{var})
+    )'''
+    else:
+        # Standard append/overwrite
+        write_mode = "overwrite"  # Default fallback
+        write_code = f'''\
 (
     df_{input_var}{select_lines}{partition_line}
     .write
@@ -663,7 +680,14 @@ def _transpile_sink(sink: DFSSink) -> tuple[str, list[tuple[str, str]]]:
     .mode("{write_mode}")
     # TODO: Configure sink path/connection for '{sink.dataset_ref}'
     .save()
-)
+)'''
+
+    code = f'''\
+# --- Sink: {sink.name} ---
+# Dataset: {sink.dataset_ref}
+# Description: {sink.description}
+# Format: {sink.format} | Batch size: {sink.batch_size or "default"}{error_lines}
+{write_code}
 logger.info("Sink [{sink.name}] write complete.")
 '''
     return code, pending
