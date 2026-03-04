@@ -240,9 +240,15 @@ def _split_statements(script: str) -> list[str]:
     i = 0
     while i < len(parts):
         stmt = parts[i].strip()
-        if i + 1 < len(parts) and parts[i + 1].strip().startswith("~>"):
+        # Accumulate all ~> parts that follow (for multi-output like split: ~> out1, out2)
+        while i + 1 < len(parts) and parts[i + 1].strip().startswith("~>"):
             stmt = stmt + " " + parts[i + 1].strip()
             i += 2
+            # If next part is a comma-continued name list (no keyword), append it
+            if i < len(parts) and not re.search(r"\b(source|sink|derive|join|filter|aggregate|select|sort|alterRow|union|exists|lookup|window|split|pivot|unpivot|foldDown|keyGenerate|rank|stringify)\s*\(", parts[i]):
+                # Could be continuation of output names
+                break
+            break
         else:
             i += 1
         if stmt and "~>" in stmt:
@@ -308,9 +314,22 @@ _TRANSFORM_KEYWORDS: dict[str, DFSTransformType] = {
 
 
 def _extract_output_name(stmt: str) -> str:
-    """Extract the output stream name from ``... ~> OutputName``."""
-    m = re.search(r"~>\s*(\w+)\s*$", stmt)
-    return m.group(1) if m else ""
+    """Extract the output stream name from ``... ~> OutputName`` or ``... ~> Name1, Name2``.
+
+    For multi-output statements (like conditional split), returns the first name.
+    Use ``_extract_output_names()`` to get all output names.
+    """
+    names = _extract_output_names(stmt)
+    return names[0] if names else ""
+
+
+def _extract_output_names(stmt: str) -> list[str]:
+    """Extract all output stream names from ``... ~> Name1, Name2, ...``."""
+    m = re.search(r"~>\s*(.+?)\s*$", stmt)
+    if not m:
+        return []
+    raw = m.group(1)
+    return [n.strip() for n in raw.split(",") if n.strip()]
 
 
 def _extract_body(stmt: str, keyword: str) -> str:
@@ -774,10 +793,45 @@ def _parse_statement(stmt: str, json_sources: dict, json_sinks: dict,
 
     # ---- CONDITIONAL SPLIT ----
     if detected_type == DFSTransformType.CONDITIONAL_SPLIT:
-        # split(condition1 => out1, condition2 => out2, ...)
+        # DFS split syntax:  input split(cond1, cond2, disjoint: false) ~> out1, out2
+        # The conditions are comma-separated in the body, and the output stream names
+        # are comma-separated after ~>. We zip them together.
+        output_names = _extract_output_names(stmt)
+
+        # Parse conditions from the body (split at top-level commas, skip known options)
+        cond_parts: list[str] = []
+        depth = 0
+        buf = ""
+        for ch in body:
+            if ch in ("(",):
+                depth += 1
+                buf += ch
+            elif ch == ")":
+                depth -= 1
+                buf += ch
+            elif ch == "," and depth == 0:
+                cond_parts.append(buf.strip())
+                buf = ""
+            else:
+                buf += ch
+        if buf.strip():
+            cond_parts.append(buf.strip())
+
+        # Filter out known options like 'disjoint: false'
+        conditions = [
+            p for p in cond_parts
+            if p and not re.match(r"^\w+\s*:\s*", p)
+        ]
+
+        # Zip conditions with output names
         split_conds: dict[str, str] = {}
-        for sm in re.finditer(r"(.+?)\s*=>\s*(\w+)", body):
-            split_conds[sm.group(2).strip()] = sm.group(1).strip()
+        for idx, out_name in enumerate(output_names):
+            if idx < len(conditions):
+                split_conds[out_name] = conditions[idx]
+            else:
+                # Default branch (no explicit condition) — catches everything else
+                split_conds[out_name] = "true()"
+
         desc = json_transforms.get(output_name, {}).get("description", "")
         return DFSTransformation(
             name=output_name,

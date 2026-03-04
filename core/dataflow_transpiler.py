@@ -141,6 +141,8 @@ def _transpile_source(source: DFSSource) -> tuple[str, list[tuple[str, str]]]:
 
     # Determine read format and options
     if source.query:
+        # Use repr() to safely escape any internal quotes in the SQL query
+        safe_query = repr(source.query)
         code = f'''\
 # --- Source: {source.name} ---
 # Dataset: {source.dataset_ref}
@@ -148,7 +150,7 @@ def _transpile_source(source: DFSSource) -> tuple[str, list[tuple[str, str]]]:
 df_{var} = (
     spark.read
     .format("jdbc")
-    .option("query", """{source.query}""")
+    .option("query", {safe_query})
     .option("isolationLevel", "{source.isolation_level}")
     # TODO: Configure JDBC connection: .option("url", ...), .option("user", ...), .option("password", ...)
     .load()
@@ -188,6 +190,9 @@ def _transpile_derive(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]
     Uses pure PySpark DSL (col, when, lit, trim, etc.) — never wraps
     PySpark functions inside expr() strings because expr() expects
     raw Spark SQL, not Python DSL code.
+
+    Chains all .withColumn() calls in a single expression to avoid
+    repeated DataFrame re-assignment overhead.
     """
     var = _safe_var(t.name)
     input_var = _safe_var(t.inputs[0]) if t.inputs else "unknown"
@@ -199,30 +204,126 @@ def _transpile_derive(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]
     if t.description:
         lines.append(f"# {t.description}")
 
-    lines.append(f"df_{var} = df_{input_var}")
-
+    # Collect all withColumn calls for chaining
+    with_col_calls: list[str] = []
     for col_name, dfs_expr in t.expressions.items():
         if _has_complex_expression(dfs_expr):
             # Complex expression → send to LLM for translation
             pending.append((f"{t.name}.{col_name}", dfs_expr))
-            # Generate a clean placeholder — LLM will replace this
-            lines.append(f'# DFS: {col_name} = {dfs_expr}')
-            lines.append(f'df_{var} = df_{var}.withColumn("{col_name}", lit(None))  # __LLM_PENDING__: {t.name}.{col_name}')
+            with_col_calls.append(f'    # DFS: {col_name} = {dfs_expr}')
+            with_col_calls.append(f'    .withColumn("{col_name}", lit(None))  # __LLM_PENDING__: {t.name}.{col_name}')
         else:
             # Simple expression — translate to PySpark DSL directly
             pyspark_expr = _translate_to_dsl(dfs_expr)
-            lines.append(f'df_{var} = df_{var}.withColumn("{col_name}", {pyspark_expr})')
+            with_col_calls.append(f'    .withColumn("{col_name}", {pyspark_expr})')
+
+    if with_col_calls:
+        chained = "\n".join(with_col_calls)
+        lines.append(f"df_{var} = (")
+        lines.append(f"    df_{input_var}")
+        lines.append(chained)
+        lines.append(")")
+    else:
+        lines.append(f"df_{var} = df_{input_var}")
 
     lines.append("")
     return "\n".join(lines), pending
+
+
+def _wrap_identifier(token: str) -> str:
+    """Wrap a bare identifier in col(), leaving literals and already-wrapped tokens alone."""
+    token = token.strip()
+    if not token:
+        return token
+    # Already wrapped in col() or a function call
+    if token.startswith("col(") or token.startswith("lit(") or "(" in token:
+        return token
+    # String literal
+    if re.match(r"^'.*'$", token) or re.match(r'^".*"$', token):
+        return f"lit({token})"
+    # Numeric literal
+    if re.match(r"^-?\d+(\.\d+)?$", token):
+        return f"lit({token})"
+    # Boolean keywords
+    if token in ("True", "False", "None"):
+        return f"lit({token})"
+    # Bare identifier → col("...")
+    if re.match(r"^\w+$", token):
+        return f'col("{token}")'
+    return token
+
+
+def _translate_comparison(clause: str) -> str:
+    """
+    Translate a single comparison clause like ``A == B`` or ``trim(X) == Y``
+    into PySpark DSL, wrapping bare identifiers in col().
+    """
+    clause = clause.strip()
+    # Match: left OP right  (where OP is ==, !=, >=, <=, >, <)
+    m = re.match(r"^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$", clause)
+    if m:
+        left = _translate_to_dsl(m.group(1).strip())
+        op = m.group(2)
+        right = _translate_to_dsl(m.group(3).strip())
+        return f"({left} {op} {right})"
+    # No comparison operator — just translate the expression
+    return _translate_to_dsl(clause)
+
+
+def _translate_join_condition(raw_condition: str) -> str:
+    """
+    Translate a full DFS join condition into PySpark DSL.
+
+    Handles ``&&`` (AND) and ``||`` (OR) operators, converting them to
+    the PySpark bitwise ``&`` and ``|`` operators with proper parentheses.
+    Example: ``A == B && C == D`` → ``(col("A") == col("B")) & (col("C") == col("D"))``
+    """
+    cond = raw_condition.strip()
+    if not cond:
+        return "True"
+
+    # Split by || first (lower precedence), then && (higher precedence)
+    or_parts = re.split(r"\s*\|\|\s*", cond)
+    translated_or: list[str] = []
+    for or_part in or_parts:
+        and_parts = re.split(r"\s*&&\s*", or_part)
+        translated_and = [_translate_comparison(ap) for ap in and_parts]
+        if len(translated_and) > 1:
+            translated_or.append("(" + " & ".join(translated_and) + ")")
+        else:
+            translated_or.append(translated_and[0])
+
+    if len(translated_or) > 1:
+        return " | ".join(translated_or)
+    return translated_or[0]
+
+
+def _translate_math_expr(expr_str: str) -> str:
+    """
+    Translate a DFS math expression (e.g. ``(NEPR/COFS)*ORQT``) into PySpark DSL,
+    wrapping bare identifiers in ``col()``.
+    """
+    # Tokenise around math operators and parens, preserving them
+    tokens = re.split(r"(\s*[+\-*/()]+\s*)", expr_str)
+    result_parts: list[str] = []
+    for token in tokens:
+        stripped = token.strip()
+        if not stripped or re.match(r"^[+\-*/()]+$", stripped):
+            result_parts.append(token)  # keep operator/paren with spacing
+        else:
+            result_parts.append(_wrap_identifier(stripped))
+    return "".join(result_parts)
 
 
 def _translate_to_dsl(dfs_expr: str) -> str:
     """
     Translate a simple DFS expression to pure PySpark DSL code.
 
-    Only handles non-nested cases. Complex/nested expressions should
-    be routed to the LLM via _has_complex_expression() check.
+    Handles:
+    - Bare identifiers → col("...")
+    - Math expressions → col("A") / col("B") * col("C")
+    - Boolean operators && / || → & / | with parenthesised clauses
+    - DFS function calls → PySpark equivalents
     """
     expr_str = dfs_expr.strip()
 
@@ -253,22 +354,30 @@ def _translate_to_dsl(dfs_expr: str) -> str:
     # Apply simple function translations
     expr_str = _translate_simple_expr(expr_str)
 
+    # Handle math expressions (contains +, -, *, /)
+    if re.search(r"[+\-*/]", expr_str) and not expr_str.startswith("col("):
+        expr_str = _translate_math_expr(expr_str)
+
     return expr_str
 
 
 
 def _transpile_join(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
-    """Generate PySpark join code."""
+    """Generate PySpark join code with proper col() wrapping and & operators."""
     var = _safe_var(t.name)
     pending: list[tuple[str, str]] = []
 
     left_var = _safe_var(t.inputs[0]) if len(t.inputs) > 0 else "unknown_left"
     right_var = _safe_var(t.inputs[1]) if len(t.inputs) > 1 else "unknown_right"
 
-    # Translate join condition
-    condition = _translate_simple_expr(t.condition) if t.condition else "True"
-    if _has_complex_expression(t.condition):
+    # Translate join condition using the new robust translator
+    if t.condition and _has_complex_expression(t.condition):
         pending.append((f"{t.name}.join_condition", t.condition))
+        condition = _translate_join_condition(t.condition)
+    elif t.condition:
+        condition = _translate_join_condition(t.condition)
+    else:
+        condition = "True"
 
     # Map DFS join types to PySpark
     join_type_map = {
@@ -285,7 +394,8 @@ def _transpile_join(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
     code = f'''\
 # --- Join: {t.name} ---
 # Type: {t.join_type} | Match: {t.match_type}
-# Condition: {t.condition}
+# Condition (DFS): {t.condition}
+# TIP: Consider .cache() or broadcast() on smaller DataFrames for performance.
 df_{var} = df_{left_var}.join(
     df_{right_var},
     on=({condition}),
@@ -480,9 +590,13 @@ def _transpile_exists(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]
     negate = "negate" in t.body and "true" in t.body.lower()
     join_how = "left_anti" if negate else "left_semi"
 
-    condition = _translate_simple_expr(t.condition) if t.condition else "True"
     if t.condition and _has_complex_expression(t.condition):
         pending.append((f"{t.name}.exists_condition", t.condition))
+        condition = _translate_join_condition(t.condition)
+    elif t.condition:
+        condition = _translate_join_condition(t.condition)
+    else:
+        condition = "True"
 
     code = f'''\
 # --- Exists: {t.name} ---
@@ -500,12 +614,17 @@ def _transpile_lookup(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]
     left_var = _safe_var(t.inputs[0]) if len(t.inputs) > 0 else "unknown"
     right_var = _safe_var(t.inputs[1]) if len(t.inputs) > 1 else "unknown"
 
-    condition = _translate_simple_expr(t.condition) if t.condition else "True"
     if t.condition and _has_complex_expression(t.condition):
         pending.append((f"{t.name}.lookup_condition", t.condition))
+        condition = _translate_join_condition(t.condition)
+    elif t.condition:
+        condition = _translate_join_condition(t.condition)
+    else:
+        condition = "True"
 
     code = f'''\
 # --- Lookup: {t.name} ---
+# TIP: Consider broadcast() on the lookup DataFrame for performance.
 df_{var} = df_{left_var}.join(df_{right_var}, on=({condition}), how="left")
 logger.info("Lookup [{t.name}] complete. Rows: %d", df_{var}.count())
 '''
@@ -533,7 +652,10 @@ df_{var} = df_{input_var}  # TODO: apply window functions
 
 
 def _transpile_conditional_split(t: DFSTransformation) -> tuple[str, list[tuple[str, str]]]:
-    """Generate PySpark conditional split (multiple filter branches)."""
+    """Generate PySpark conditional split (multiple filter branches).
+
+    Each output stream from the split becomes its own filtered DataFrame.
+    """
     input_var = _safe_var(t.inputs[0]) if t.inputs else "unknown"
     pending: list[tuple[str, str]] = []
 
@@ -541,10 +663,13 @@ def _transpile_conditional_split(t: DFSTransformation) -> tuple[str, list[tuple[
 
     for output_name, cond in t.split_conditions.items():
         out_var = _safe_var(output_name)
-        translated = _translate_simple_expr(cond)
         if _has_complex_expression(cond):
             pending.append((f"{t.name}.{output_name}", cond))
-        lines.append(f'df_{out_var} = df_{input_var}.filter({repr(translated)})')
+            translated = _translate_join_condition(cond)
+        else:
+            translated = _translate_join_condition(cond)
+        lines.append(f'df_{out_var} = df_{input_var}.filter({translated})')
+        lines.append(f'logger.info("ConditionalSplit [{t.name}] -> {output_name}: %d rows", df_{out_var}.count())')
 
     lines.append("")
     return "\n".join(lines), pending
